@@ -5,6 +5,7 @@ import dbridge.analysis.jdbc.JdbcDriver;
 import dbridge.rewrite.BodyRewriter;
 import dbridge.rewrite.JavaWriter;
 
+import java.nio.file.Files;
 import java.nio.file.Paths;
 
 /**
@@ -40,7 +41,9 @@ public class Main {
         BodyRewriter rewriter = new BodyRewriter(fsa.getBody(), fsa.getLoopsSwallowed());
         rewriter.rewriteBody();
 
-        JavaWriter.writeJimple(fsa.getBody(), Paths.get(outputFile));
-        System.out.println("Transformed body written to " + outputFile);
+        String java = JavaWriter.toJava(fsa.getBody());
+        Files.writeString(Paths.get(outputFile), java);
+        System.out.println("Transformed Java written to " + outputFile);
+        System.out.println(java);
     }
 }

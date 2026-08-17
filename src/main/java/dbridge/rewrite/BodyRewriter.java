@@ -120,10 +120,6 @@ public class BodyRewriter {
         if (loopCond == null) {
             return;
         }
-        // In Soot's Jimple the loop head condition is at the bottom (do-while
-        // form) and branches back to the body. The loop exit is the fall-through
-        // unit following the condition.
-        Unit exitTarget = body.getUnits().getSuccOf(loopCond);
 
         List<Unit> bindingStmts = new ArrayList<>();
         Unit queryExec = null;
@@ -132,7 +128,8 @@ public class BodyRewriter {
         Unit getIntStmt = null;
         Unit accumulate = null;
 
-        for (Unit unit : bodyRegion.getUnits()) {
+        List<Unit> bodyUnits = bodyRegion.getUnits();
+        for (Unit unit : bodyUnits) {
             if (unit instanceof InvokeStmt) {
                 InvokeExpr invoke = ((InvokeStmt) unit).getInvokeExpr();
                 if (BIND_METHODS.contains(invoke.getMethod().getName())) {
@@ -189,6 +186,28 @@ public class BodyRewriter {
             if (unit != null) {
                 body.getUnits().remove(unit);
             }
+        }
+
+        // Determine the loop exit robustly for both Jimple loop forms:
+        //   while form:  if (cond) goto exit;  body;  goto head   -> target == exit
+        //   do-while form: goto head; body; if (!cond) goto body  -> fall-through == exit
+        // The exit is whichever of the condition's target / successor is not part
+        // of the loop body.
+        Unit exitTarget = null;
+        Unit condTarget = loopCond.getTarget();
+        Unit condSucc = null;
+        try {
+            condSucc = body.getUnits().getSuccOf(loopCond);
+        } catch (RuntimeException ignored) {
+            // loopCond is the last unit; only the target matters.
+        }
+        if (condTarget != null && !bodyUnits.contains(condTarget)) {
+            exitTarget = condTarget;
+        } else if (condSucc != null && !bodyUnits.contains(condSucc)) {
+            exitTarget = condSucc;
+        }
+        if (exitTarget == null) {
+            return;
         }
 
         // Build the batch + result loop and insert before the loop exit.

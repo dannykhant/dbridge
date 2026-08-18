@@ -59,16 +59,16 @@ while (pstmt.getMoreResults()) {
 
 ```mermaid
 flowchart TD
-    A[Source Java] -->|Soot| B[Jimple]
+    A[Compiled original classes] -->|Soot| B[Jimple]
     B --> C[Region tree]
     C --> D["DIR (expression DAG)"]
     D -->|"DIR*RegionAnalyzers (fold detection)"| E["FoldNode + swallowed loops"]
-    E -->|"TransDriver.applyAllTransRules"| F["BodyRewriter (split loop → batched JDBC)"]
-    F --> G[Modified Jimple]
-    G --> H[target file]
+    E -->|"TransDriver.applyAllTransRules"| F["BodyRewriter (simple or conditional/order-sensitive path)"]
+    F --> G[Modified Jimple body]
+    G -->|JavaWriter| H[Transformed method body]
 ```
 
-1. **Parsing / IR** — Soot parses Java bytecode into Jimple.
+1. **Parsing / IR** — `Main` loads compiled original classes, and Soot parses the selected method's JVM bytecode into Jimple.
 2. **Region tree** — a structured control-flow tree (`LoopRegion`,
    `BranchRegion`, `SequentialRegion`) is built over the Jimple body.
 3. **DIR analysis** — per-region analyzers walk the region tree bottom-up and
@@ -80,13 +80,15 @@ flowchart TD
    replaces the loop with a `FoldNode`.
 5. **Rule engine** — `TransDriver` applies pattern-matching `Rule` objects
    (simplification/fold) to refine the DAG.
-6. **Rewrite** — `BodyRewriter` splits the loop into a parameter-binding loop,
-   an `executeBatch()` call, and a result-consumption loop.
+6. **Rewrite** — `BodyRewriter` handles the simple loop-splitting/query-rewrite
+   path and the conditional/order-sensitive path. The latter uses guarded
+   statements and `LoopContextTable` to preserve iteration order.
 7. **Runtime** — `executeBatch()` materializes the bindings into a temporary
    table and rewrites the query to its set-oriented form.
 
-The final output is the **optimized `.java` source** (readable Java emitted from
-the modified Jimple).
+`JavaWriter` emits the transformed method body as readable Java source. DBridge
+does not emit a complete replacement class; the example pipeline inserts this
+method body into a generated source copy before compiling it.
 
 ---
 
@@ -182,8 +184,9 @@ a `FoldNode` and records the "swallowed" loop.
    `SELECT <agg> FROM <t> WHERE <col> = ?` into the unnest form
    `SELECT <agg> FROM pb LEFT JOIN <t> ON pb.<col> = <t>.<col> GROUP BY pb.<col>`
    (the equivalent of the paper's `OUTER APPLY`/`LATERAL` rewrite).
-4. Executes it once and exposes one single-row `ResultSet` per binding through
-   `getMoreResults()`/`getResultSet()`.
+4. Executes it once and exposes a single multi-row `ResultSet` via `getResultSet()`.
+   For order-sensitive programs, `LoopContextTable.mergeResults(...)` matches each
+   result row back to its record by the binding key.
 
 Non-aggregate statements (e.g. `INSERT`) use the native JDBC batch.
 
@@ -210,20 +213,26 @@ java -cp "$CP" dbridge.Main \
   /tmp/out.java
 ```
 
-This writes the transformed Java to `/tmp/out.java` and prints it to stdout.
+The input classpath must contain compiled classes. This writes the transformed
+method body to `/tmp/out.java` and prints it to stdout; the output is not a
+complete Java class.
 
 ---
 
 ## End-to-end example
 
-`examples/run.sh` runs a complete, runnable demo end to end:
+`examples/run.sh` runs a complete, runnable demo on
+`dbridge.example.PartCountApp.computeTotal`, exercising statement reordering,
+loop splitting, query rewriting, conditional blocks, and order-sensitive
+operations:
 
-1. Compiles and runs the **original** application (`examples/PartCountApp.java`),
-   which computes a category roll-up with one JDBC query per category.
-2. Transforms its `computeTotal` method with DBridge.
-3. Assembles, compiles and runs the **optimized** application
-   (`PartCountAppOptimized.java`) against the DBridge runtime.
-4. Compares the result (correctness) and query time (performance).
+| Method | Where in the program |
+|---|---|
+| Statement reordering | loop-var update separated from the query |
+| Loop splitting | one binding loop + one result loop |
+| Query rewrite | `executeBatch()` runs a set-oriented query |
+| Conditional blocks | `if (isActive)` becomes a guarded boolean flag |
+| Order-sensitive ops | `log(...)` observes iteration order via `LoopContextTable` |
 
 ```bash
 cd /path/to/dbridge
@@ -238,30 +247,53 @@ Example output:
 
 ```
 ==> Categories: 50000
-==> Building DBridge (skip tests)
+==> Building DBridge runtime (skip tests)
 ==> Compiling original application
-==> Running ORIGINAL application (iterative JDBC)
-RESULT=150000
-SETUP_MS=1007
-QUERY_MS=225
-==> Transforming computeTotal with DBridge
-==> Assembling optimized application
+==> Transforming PartCountApp.computeTotal with DBridge
+==> Generating optimized application from transformed method
 ==> Compiling optimized application
+==> Running ORIGINAL application (iterative JDBC)
+RESULT=75000
+LOG_HASH=938711584
+SETUP_MS=1026
+QUERY_MS=149
 ==> Running OPTIMIZED application (batched JDBC)
-RESULT=150000
-SETUP_MS=749
-QUERY_MS=412
+RESULT=75000
+LOG_HASH=938711584
+SETUP_MS=1037
+QUERY_MS=300
 
 ==> Comparison
-Original result : 150000
-Optimized result: 150000
-CORRECTNESS: PASS (identical results)
-Query time - original : 225 ms
-Query time - optimized: 412 ms
+Result - original : 75000
+Result - optimized: 75000
+Log hash - original : 938711584
+Log hash - optimized: 938711584
+CORRECTNESS: PASS (result and order match)
+Query time - original : 149 ms
+Query time - optimized: 300 ms
 ```
 
-The transformed method and the assembled optimized class are written to
-`examples/build/` (`computeTotal.java` and `PartCountAppOptimized.java`).
+`RESULT` (the aggregate) and `LOG_HASH` (the order-sensitive side effect) must
+match. The comparison checks both values and reports whether the transformed
+method preserved the original result and log order.
+
+> Performance note: H2 is in-memory, so an indexed point query is already ~microseconds,
+> and the batched form's `LoopContextTable` bookkeeping can outweigh the saved
+> round-trips. The speedup materializes on databases with network round-trip
+> latency or expensive random I/O.
+
+`examples/PartCountApp.java` is the original source. `examples/run.sh` first
+compiles it into `examples/build/original-classes`, analyzes that compiled class
+with DBridge, and writes the transformed method to
+`examples/build/computeTotal.java`. It replaces `computeTotal` in a generated
+source copy at `examples/build/PartCountApp.java`, then compiles that copy into
+`examples/build/optimized-classes`. The original and optimized applications are
+run from their separate class directories and their `RESULT` and `LOG_HASH`
+values are compared. All generated artifacts live under `examples/build`.
+
+The `.class` files in those directories are JVM bytecode, not Java source. VS
+Code may display them as decompiled Java, but DBridge itself analyzes the
+bytecode and `JavaWriter` emits only the transformed method body.
 
 ---
 
@@ -270,9 +302,9 @@ The transformed method and the assembled optimized class are written to
 | Test | What it verifies |
 |---|---|
 | `JdbcDriverTest` | Fold detection (loop → `FoldNode`, 1 swallowed loop) |
-| `BodyRewriterTest` | Transformed Jimple contains `addBatch`/`executeBatch`/`getMoreResults`/`getResultSet` |
+| `BodyRewriterTest` | Transformed Jimple contains `addBatch`/`executeBatch`/`getResultSet` |
 | `JavaWriterTest` | Transformed body renders as readable Java (while loop, batch + result calls) |
-| `DBridgeRuntimeTest` | Set-oriented rewrite correctness vs H2 (incl. LEFT JOIN zero-count), `mergeResults`, native INSERT batch |
+| `DBridgeRuntimeTest` | Set-oriented rewrite correctness vs H2 (incl. LEFT JOIN zero-count), `mergeResults` by key, native INSERT batch |
 | `IntegrationTest` | Original vs transformed produce identical results on H2 |
 
 ---
@@ -282,10 +314,13 @@ The transformed method and the assembled optimized class are written to
 - Query rewrite covers a scalar aggregate `SELECT … WHERE col = ?` and bulk
   `INSERT`; arbitrary SQL and multi-parameter `WHERE` predicates are not yet
   handled.
-- Order-sensitive operations (paper Example 4) are supported by
-  `LoopContextTable`/`mergeResults` but not covered by an end-to-end test.
-- Nested loops and conditional blocks (Example 3) are the next extensions.
-- Java output is produced by a lightweight Jimple→Java emitter (readable but
-  uses Soot's temporary variable names). Soot's Dava decompiler — the paper's
-  "Decompile" step — does not run on JDK 9+, so the custom emitter is used
-  instead.
+- `BodyRewriter` recognizes the supported loop shapes rather than arbitrary
+  Java control flow. The simple path handles a query-bearing loop; the
+  conditional/order-sensitive path currently batches inactive categories too
+  and filters them during result consumption.
+- Nested loops are the next extension.
+- `JavaWriter` is a lightweight, best-effort Jimple-to-Java emitter for the
+  regular transformed shape. Its output is readable but may use Soot temporary
+  variable names and is a method body, not a complete class. Soot's Dava
+  decompiler, corresponding to the paper's "Decompile" step, does not run on
+  JDK 9+, so the custom emitter is used instead.

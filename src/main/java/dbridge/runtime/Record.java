@@ -10,7 +10,6 @@ import java.util.Set;
 public class Record {
 
     private final LinkedHashMap<String, Object> columns = new LinkedHashMap<>();
-
     public Record() {
     }
 
@@ -59,4 +58,5 @@ public class Record {
     public String getString(int index) {
         return (String) get(index);
     }
+
 }

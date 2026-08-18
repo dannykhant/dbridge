@@ -3,10 +3,8 @@ package dbridge.runtime;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 
 /**
  * An ordered table of loop-context {@link Record}s, iterated in the order the
@@ -26,7 +24,7 @@ public class LoopContextTable implements Iterable<Record> {
         r.set("c0", key);
         r.set("c1", flag);
         r.set("c2", value);
-        records.add(r);
+        addRecord(r);
     }
 
     public int size() {
@@ -40,26 +38,20 @@ public class LoopContextTable implements Iterable<Record> {
 
     /**
      * Augment each record with the set-oriented query result for its loop key.
-     * Each result row is {@code (aggregate, key)}; the aggregate is stored in
-     * the record as a new "result" column.
+     * Each result row is {@code (aggregate, key, batchOrdinal)}; the aggregate
+     * is stored in the matching record as a new "result" column.
      */
     public void mergeResults(DBridgePreparedStatement pstmt) throws SQLException {
-        Map<Object, Record> byKey = new HashMap<>();
-        for (Record r : records) {
-            Object key = r.get(0);
-            if (key != null) {
-                byKey.put(key, r);
-            }
-        }
+        List<Record> byOrdinal = new ArrayList<>(records);
         ResultSet rs = pstmt.getResultSet();
         if (rs == null) {
             return;
         }
         while (rs.next()) {
             Object aggregate = rs.getObject(1);
-            Object key = rs.getObject(2);
-            Record r = byKey.get(key);
-            if (r != null) {
+            long ordinal = rs.getLong(3);
+            if (!rs.wasNull() && ordinal >= 0 && ordinal < byOrdinal.size()) {
+                Record r = byOrdinal.get((int) ordinal);
                 r.set("result", aggregate);
             }
         }

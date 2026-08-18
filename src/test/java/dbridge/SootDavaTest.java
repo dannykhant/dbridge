@@ -3,14 +3,17 @@ package dbridge;
 import dbridge.analysis.jdbc.FuncStackAnalyzer;
 import dbridge.analysis.jdbc.JdbcDriver;
 import dbridge.rewrite.BodyRewriter;
-import dbridge.rewrite.JavaWriter;
+import dbridge.rewrite.SootDava;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-public class JavaWriterTest {
+public class SootDavaTest {
 
     private static String classPath() {
         String base = System.getProperty("user.dir");
@@ -19,7 +22,7 @@ public class JavaWriterTest {
     }
 
     @Test
-    public void testJavaOutput() {
+    public void testSourceOutput() throws Exception {
         JdbcDriver driver = new JdbcDriver(classPath());
         FuncStackAnalyzer fsa = driver.analyze("dbridge.test.Example1", "int getTotalPartCount(int)");
         assertTrue(fsa.isSuccess());
@@ -27,11 +30,12 @@ public class JavaWriterTest {
         BodyRewriter rewriter = new BodyRewriter(fsa.getBody(), fsa.getLoopsSwallowed());
         rewriter.rewriteBody();
 
-        String java = JavaWriter.toJava(fsa.getBody());
-        assertTrue(java.contains("while"), "should contain a while loop");
-        assertTrue(java.contains("executeBatch"), "should contain executeBatch");
-        assertTrue(java.contains("addBatch"), "should contain addBatch");
-        assertTrue(java.contains("getResultSet"), "should contain getResultSet");
-        assertTrue(java.contains("return"), "should contain a return statement");
+        String java = SootDava.emit(new String(Files.readAllBytes(Paths.get("src/test/java/dbridge/test/Example1.java")), StandardCharsets.UTF_8), fsa.getBody());
+        assertTrue(java.contains("class Example1"));
+        assertTrue(java.contains("while"));
+        assertTrue(java.contains("executeBatch"));
+        assertTrue(java.contains("addBatch"));
+        assertTrue(java.contains("getResultSet"));
+        assertTrue(java.contains("return"));
     }
 }

@@ -70,8 +70,8 @@ public class DBridgeRuntimeTest {
             DBridgePreparedStatement pstmt = dbc.prepareStatement(
                     "SELECT count(partkey) FROM part WHERE category = ?");
             LoopContextTable ctx = new LoopContextTable();
-            int[] cats = {1, 2, 3};
-            long[] expected = {2L, 1L, 1L};
+            int[] cats = {1, 1, 2};
+            long[] expected = {2L, 2L, 1L};
             for (int c : cats) {
                 pstmt.bind(1, c);
                 pstmt.addBatch();
@@ -89,6 +89,15 @@ public class DBridgeRuntimeTest {
                 idx++;
             }
             assertEquals(3, ctx.size());
+
+            pstmt.bind(1, 3);
+            pstmt.addBatch();
+            pstmt.executeBatch();
+            ResultSet secondResult = pstmt.getResultSet();
+            assertTrue(secondResult.next());
+            assertEquals(1L, secondResult.getLong(1));
+            assertEquals(3, secondResult.getInt(2));
+            assertTrue(!secondResult.next());
             dbc.close();
         }
     }

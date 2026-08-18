@@ -56,6 +56,11 @@ public class DBridgePreparedStatement {
         pstmt.setLong(parameterIndex, x);
     }
 
+    public void setDouble(int parameterIndex, double x) throws SQLException {
+        setBinding(parameterIndex, x);
+        pstmt.setDouble(parameterIndex, x);
+    }
+
     public void setObject(int parameterIndex, Object x) throws SQLException {
         setBinding(parameterIndex, x);
         pstmt.setObject(parameterIndex, x);
@@ -81,17 +86,26 @@ public class DBridgePreparedStatement {
     }
 
     public void executeBatch() throws SQLException {
-        if (isScalarAggregate()) {
-            executeScalarAggregate(scalarInfo);
-        } else {
-            pstmt.executeBatch();
-            try {
-                ResultSet keys = pstmt.getGeneratedKeys();
-                if (keys != null) {
-                    results.add(keys);
+        resetExecutionState();
+        boolean scalar = isScalarAggregate();
+        try {
+            if (scalar) {
+                executeScalarAggregate(scalarInfo);
+            } else {
+                pstmt.executeBatch();
+                try {
+                    ResultSet keys = pstmt.getGeneratedKeys();
+                    if (keys != null) {
+                        results.add(keys);
+                    }
+                } catch (SQLException ignored) {
+                    // Not all statements return generated keys.
                 }
-            } catch (SQLException ignored) {
-                // Not all statements return generated keys.
+            }
+        } finally {
+            batches.clear();
+            if (!scalar) {
+                pstmt.clearBatch();
             }
         }
     }
@@ -153,6 +167,18 @@ public class DBridgePreparedStatement {
         }
     }
 
+    private void resetExecutionState() throws SQLException {
+        for (ResultSet rs : results) {
+            rs.close();
+        }
+        for (Statement st : heldStatements) {
+            st.close();
+        }
+        results.clear();
+        heldStatements.clear();
+        resultIndex = -1;
+    }
+
     private ScalarAggregateInfo parseScalarAggregate() {
         try {
             net.sf.jsqlparser.statement.Statement stmt = CCJSqlParserUtil.parse(sql);
@@ -202,14 +228,16 @@ public class DBridgePreparedStatement {
         String type = sqlTypeFor(firstBindingValue());
         try (Statement st = conn.createStatement()) {
             st.execute("DROP TABLE IF EXISTS " + TEMP_TABLE);
-            st.execute("CREATE TABLE " + TEMP_TABLE + " (" + col + " " + type + ")");
+            st.execute("CREATE TABLE " + TEMP_TABLE + " (batch_ordinal BIGINT, " + col + " " + type + ")");
             st.execute("CREATE INDEX " + TEMP_TABLE + "_idx ON " + TEMP_TABLE + "(" + col + ")");
         }
         try (PreparedStatement ins = conn.prepareStatement(
-                "INSERT INTO " + TEMP_TABLE + " (" + col + ") VALUES (?)")) {
-            for (Object[] b : batches) {
+                "INSERT INTO " + TEMP_TABLE + " (batch_ordinal, " + col + ") VALUES (?, ?)")) {
+            for (int ordinal = 0; ordinal < batches.size(); ordinal++) {
+                Object[] b = batches.get(ordinal);
+                ins.setLong(1, ordinal);
                 Object val = b.length > 1 ? b[1] : null;
-                ins.setObject(1, val);
+                ins.setObject(2, val);
                 ins.addBatch();
             }
             ins.executeBatch();
@@ -282,6 +310,7 @@ public class DBridgePreparedStatement {
         sb.append("SELECT ").append(aggSelect)
                 .append(", ").append(tempTable).append('.').append(col)
                 .append(" AS ").append(col)
+                .append(", ").append(tempTable).append(".batch_ordinal")
                 .append(" FROM ").append(tempTable)
                 .append(" LEFT JOIN ").append(joinTable)
                 .append(" ON ").append(tempTable).append('.').append(col)
@@ -289,7 +318,8 @@ public class DBridgePreparedStatement {
         if (info.extraConditions != null) {
             sb.append(" AND ").append(info.extraConditions);
         }
-        sb.append(" GROUP BY ").append(tempTable).append('.').append(col);
+        sb.append(" GROUP BY ").append(tempTable).append(".batch_ordinal, ")
+                .append(tempTable).append('.').append(col);
         return sb.toString();
     }
 

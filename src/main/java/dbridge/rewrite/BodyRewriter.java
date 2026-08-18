@@ -56,12 +56,31 @@ public class BodyRewriter {
     }
 
     public void rewriteBody() {
-        rewriteJdbcSetup();
         BriefUnitGraph ug = new BriefUnitGraph(body);
         LoopFinder loopFinder = new LoopFinder();
+        List<Loop> candidates = new ArrayList<>();
         for (Loop loop : loopFinder.getLoops(ug)) {
+            if (isAnalyzedCandidate(loop)) {
+                candidates.add(loop);
+            }
+        }
+        if (candidates.isEmpty()) {
+            return;
+        }
+        rewriteJdbcSetup();
+        for (Loop loop : candidates) {
             transformLoop(loop);
         }
+    }
+
+    private boolean isAnalyzedCandidate(Loop loop) {
+        List<Unit> loopUnits = new ArrayList<>(loop.getLoopStatements());
+        for (LoopRegion region : loopsSwallowed) {
+            if (region.getUnits().containsAll(loopUnits)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------
@@ -100,8 +119,8 @@ public class BodyRewriter {
 
         SootMethodRef ref = Scene.v().makeMethodRef(
                 resolve("dbridge.runtime.DBridgeConnection"), "getConnection",
-                List.of(RefType.v("java.lang.String")), RefType.v("dbridge.runtime.DBridgeConnection"), true);
-        assign.setRightOp(Jimple.v().newStaticInvokeExpr(ref, List.of(newUrl)));
+                Arrays.asList(RefType.v("java.lang.String")), RefType.v("dbridge.runtime.DBridgeConnection"), true);
+        assign.setRightOp(Jimple.v().newStaticInvokeExpr(ref, Arrays.asList(newUrl)));
     }
 
     private void rewritePrepareStatement(AssignStmt assign, InstanceInvokeExpr invoke) {
@@ -110,7 +129,7 @@ public class BodyRewriter {
 
         SootMethodRef ref = Scene.v().makeMethodRef(
                 resolve("dbridge.runtime.DBridgeConnection"), "prepareStatement",
-                List.of(RefType.v("java.lang.String")), RefType.v("dbridge.runtime.DBridgePreparedStatement"), false);
+                Arrays.asList(RefType.v("java.lang.String")), RefType.v("dbridge.runtime.DBridgePreparedStatement"), false);
         assign.setRightOp(Jimple.v().newVirtualInvokeExpr((Local) invoke.getBase(), ref, invoke.getArgs()));
     }
 
@@ -277,7 +296,7 @@ public class BodyRewriter {
                 oldInvoke.getMethod().getParameterTypes(), VoidType.v(), false);
         Local base = (Local) oldInvoke.getBase();
         binding.setInvokeExpr(Jimple.v().newVirtualInvokeExpr(base, setRef, oldInvoke.getArgs()));
-        SootMethodRef addBatchRef = Scene.v().makeMethodRef(dbps, "addBatch", List.of(), VoidType.v(), false);
+        SootMethodRef addBatchRef = Scene.v().makeMethodRef(dbps, "addBatch", Arrays.asList(), VoidType.v(), false);
         body.getUnits().insertAfter(Jimple.v().newInvokeStmt(
                 Jimple.v().newVirtualInvokeExpr(base, addBatchRef, new ArrayList<Value>())), binding);
 
@@ -300,13 +319,13 @@ public class BodyRewriter {
         SootClass rsClass = resolve("java.sql.ResultSet");
 
         SootMethodRef executeBatchRef = Scene.v().makeMethodRef(dbps, "executeBatch",
-                List.of(), VoidType.v(), false);
+                Arrays.asList(), VoidType.v(), false);
         SootMethodRef getResultSetRef = Scene.v().makeMethodRef(dbps, "getResultSet",
-                List.of(), RefType.v("java.sql.ResultSet"), false);
+                Arrays.asList(), RefType.v("java.sql.ResultSet"), false);
         SootMethodRef rsNextRef = Scene.v().makeMethodRef(rsClass, "next",
-                List.of(), BooleanType.v(), false);
+                Arrays.asList(), BooleanType.v(), false);
         SootMethodRef rsGetIntRef = Scene.v().makeMethodRef(rsClass, "getInt",
-                List.of(IntType.v()), IntType.v(), false);
+                Arrays.asList(IntType.v()), IntType.v(), false);
 
         List<Unit> units = new ArrayList<>();
         units.add(Jimple.v().newInvokeStmt(
@@ -318,7 +337,7 @@ public class BodyRewriter {
         units.add(rsNext);
         units.add(Jimple.v().newIfStmt(Jimple.v().newEqExpr(nextResult, IntConstant.v(0)), exitTarget));
         units.add(Jimple.v().newAssignStmt(resultVal,
-                Jimple.v().newInterfaceInvokeExpr(rs, rsGetIntRef, List.of(IntConstant.v(1)))));
+                Jimple.v().newInterfaceInvokeExpr(rs, rsGetIntRef, Arrays.asList(IntConstant.v(1)))));
         units.add(Jimple.v().newAssignStmt(agg, Jimple.v().newAddExpr(agg, resultVal)));
         units.add(Jimple.v().newGotoStmt(rsNext));
         return units;
@@ -335,7 +354,7 @@ public class BodyRewriter {
         // 1. ctx = new LoopContextTable() before the loop.
         Local ctx = Jimple.v().newLocal("ctx", RefType.v("dbridge.runtime.LoopContextTable"));
         body.getLocals().add(ctx);
-        SootMethodRef lctInit = Scene.v().makeMethodRef(lct, "<init>", List.of(), VoidType.v(), false);
+        SootMethodRef lctInit = Scene.v().makeMethodRef(lct, "<init>", Arrays.asList(), VoidType.v(), false);
         Unit newLct = Jimple.v().newAssignStmt(ctx,
                 Jimple.v().newNewExpr(RefType.v("dbridge.runtime.LoopContextTable")));
         Unit callInit = Jimple.v().newInvokeStmt(Jimple.v().newSpecialInvokeExpr(ctx, lctInit));
@@ -362,7 +381,7 @@ public class BodyRewriter {
                 oldInvoke.getMethod().getParameterTypes(), VoidType.v(), false);
         Local base = (Local) oldInvoke.getBase();
         binding.setInvokeExpr(Jimple.v().newVirtualInvokeExpr(base, setRef, oldInvoke.getArgs()));
-        SootMethodRef addBatchRef = Scene.v().makeMethodRef(dbps, "addBatch", List.of(), VoidType.v(), false);
+        SootMethodRef addBatchRef = Scene.v().makeMethodRef(dbps, "addBatch", Arrays.asList(), VoidType.v(), false);
         body.getUnits().insertAfter(Jimple.v().newInvokeStmt(
                 Jimple.v().newVirtualInvokeExpr(base, addBatchRef, new ArrayList<Value>())), binding);
 
@@ -374,9 +393,9 @@ public class BodyRewriter {
 
         // 5. ctx.addRecord(tempCat, flag, tempCat) after the loop-var update.
         SootMethodRef addRecordRef = Scene.v().makeMethodRef(lct, "addRecord",
-                List.of(IntType.v(), BooleanType.v(), IntType.v()), VoidType.v(), false);
+                Arrays.asList(IntType.v(), BooleanType.v(), IntType.v()), VoidType.v(), false);
         Unit addRecord = Jimple.v().newInvokeStmt(Jimple.v().newVirtualInvokeExpr(ctx, addRecordRef,
-                List.of(tempCat, p.flag, tempCat)));
+                Arrays.asList(tempCat, p.flag, tempCat)));
         body.getUnits().insertAfter(addRecord, p.loopVarUpdate);
 
         // 6. Remove the query/result/order-sensitive statements from the loop.
@@ -401,19 +420,19 @@ public class BodyRewriter {
         SootClass iter = resolve("java.util.Iterator");
 
         SootMethodRef executeBatchRef = Scene.v().makeMethodRef(dbps, "executeBatch",
-                List.of(), VoidType.v(), false);
+                Arrays.asList(), VoidType.v(), false);
         SootMethodRef mergeRef = Scene.v().makeMethodRef(lct, "mergeResults",
-                List.of(RefType.v("dbridge.runtime.DBridgePreparedStatement")), VoidType.v(), false);
+                Arrays.asList(RefType.v("dbridge.runtime.DBridgePreparedStatement")), VoidType.v(), false);
         SootMethodRef iteratorRef = Scene.v().makeMethodRef(lct, "iterator",
-                List.of(), RefType.v("java.util.Iterator"), false);
+                Arrays.asList(), RefType.v("java.util.Iterator"), false);
         SootMethodRef hasNextRef = Scene.v().makeMethodRef(iter, "hasNext",
-                List.of(), BooleanType.v(), false);
+                Arrays.asList(), BooleanType.v(), false);
         SootMethodRef nextRef = Scene.v().makeMethodRef(iter, "next",
-                List.of(), RefType.v("java.lang.Object"), false);
+                Arrays.asList(), RefType.v("java.lang.Object"), false);
         SootMethodRef getIntRef = Scene.v().makeMethodRef(rec, "getInt",
-                List.of(IntType.v()), IntType.v(), false);
+                Arrays.asList(IntType.v()), IntType.v(), false);
         SootMethodRef getBoolRef = Scene.v().makeMethodRef(rec, "getBoolean",
-                List.of(IntType.v()), BooleanType.v(), false);
+                Arrays.asList(IntType.v()), BooleanType.v(), false);
 
         Local it = Jimple.v().newLocal("it", RefType.v("java.util.Iterator"));
         Local nextObject = Jimple.v().newLocal("nextObject", RefType.v("java.lang.Object"));
@@ -431,7 +450,7 @@ public class BodyRewriter {
                 Jimple.v().newVirtualInvokeExpr(p.pstmt, executeBatchRef, new ArrayList<Value>())));
         // ctx.mergeResults(pstmt)
         units.add(Jimple.v().newInvokeStmt(
-                Jimple.v().newVirtualInvokeExpr(ctx, mergeRef, List.of(p.pstmt))));
+                Jimple.v().newVirtualInvokeExpr(ctx, mergeRef, Arrays.asList(p.pstmt))));
         // it = ctx.iterator()
         units.add(Jimple.v().newAssignStmt(it,
                 Jimple.v().newVirtualInvokeExpr(ctx, iteratorRef, new ArrayList<Value>())));
@@ -453,15 +472,15 @@ public class BodyRewriter {
 
         // flag = record.getBoolean(1); if flag == 0 goto loop head
         units.add(Jimple.v().newAssignStmt(p.flag,
-                Jimple.v().newVirtualInvokeExpr(record, getBoolRef, List.of(IntConstant.v(1)))));
+                Jimple.v().newVirtualInvokeExpr(record, getBoolRef, Arrays.asList(IntConstant.v(1)))));
         IfStmt ifInactive = Jimple.v().newIfStmt(Jimple.v().newEqExpr(p.flag, IntConstant.v(0)), hasNext);
         units.add(ifInactive);
 
         // loopVar = record.getInt(2); resultVal = record.getInt(3)
         units.add(Jimple.v().newAssignStmt(p.loopVar,
-                Jimple.v().newVirtualInvokeExpr(record, getIntRef, List.of(IntConstant.v(2)))));
+                Jimple.v().newVirtualInvokeExpr(record, getIntRef, Arrays.asList(IntConstant.v(2)))));
         units.add(Jimple.v().newAssignStmt(p.resultVal,
-                Jimple.v().newVirtualInvokeExpr(record, getIntRef, List.of(IntConstant.v(3)))));
+                Jimple.v().newVirtualInvokeExpr(record, getIntRef, Arrays.asList(IntConstant.v(3)))));
 
         // accumulate: agg = agg + resultVal
         units.add(Jimple.v().newAssignStmt(p.agg, Jimple.v().newAddExpr(p.agg, p.resultVal)));

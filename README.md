@@ -65,7 +65,7 @@ flowchart TD
     D -->|"DIR*RegionAnalyzers (fold detection)"| E["FoldNode + swallowed loops"]
     E -->|"TransDriver.applyAllTransRules"| F["BodyRewriter (simple or conditional/order-sensitive path)"]
     F --> G[Modified Jimple body]
-    G -->|JavaWriter| H[Transformed method body]
+    G -->|SourceWriter| H[Transformed Java source]
 ```
 
 1. **Parsing / IR** — `Main` loads compiled original classes, and Soot parses the selected method's JVM bytecode into Jimple.
@@ -86,9 +86,8 @@ flowchart TD
 7. **Runtime** — `executeBatch()` materializes the bindings into a temporary
    table and rewrites the query to its set-oriented form.
 
-`JavaWriter` emits the transformed method body as readable Java source. DBridge
-does not emit a complete replacement class; the example pipeline inserts this
-method body into a generated source copy before compiling it.
+`SourceWriter` replaces the selected method in the original source, preserving
+the rest of the class and its exception/resource structure.
 
 ---
 
@@ -114,7 +113,9 @@ dbridge/
 │       └── JdbcDriver.java         Orchestrator (port of EqSQLDriver)
 ├── rewrite/
 │   ├── BodyRewriter.java           Loop splitting → batched JDBC
-│   └── JavaWriter.java             Jimple → readable Java source emitter
+│   ├── JavaWriter.java              Transformed Jimple method renderer
+│   ├── SourceWriter.java            Source-preserving method replacement
+│   └── SootDava.java                Source-emission facade
 ├── runtime/                        Runtime JDBC wrapper library
 │   ├── DBridgeConnection.java
 │   ├── DBridgePreparedStatement.java  bind/addBatch/executeBatch/getMoreResults/
@@ -186,7 +187,8 @@ a `FoldNode` and records the "swallowed" loop.
    (the equivalent of the paper's `OUTER APPLY`/`LATERAL` rewrite).
 4. Executes it once and exposes a single multi-row `ResultSet` via `getResultSet()`.
    For order-sensitive programs, `LoopContextTable.mergeResults(...)` matches each
-   result row back to its record by the binding key.
+    result row back to its record by a stable batch ordinal, preserving duplicate
+    bindings and loop order.
 
 Non-aggregate statements (e.g. `INSERT`) use the native JDBC batch.
 
@@ -194,11 +196,11 @@ Non-aggregate statements (e.g. `INSERT`) use the native JDBC batch.
 
 ## Building and running
 
-Requires JDK 17 and Maven.
+Requires JDK 8 and Maven.
 
 ```bash
 cd /path/to/dbridge
-export JAVA_HOME="/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
+export JAVA_HOME="/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home"
 export PATH="$JAVA_HOME/bin:$PATH"
 
 mvn test            # run all tests (7 tests)
@@ -210,12 +212,11 @@ java -cp "$CP" dbridge.Main \
   "target/classes:target/test-classes" \
   dbridge.test.Example1 \
   "int getTotalPartCount(int)" \
-  /tmp/out.java
+  /tmp/out.java /path/to/Example1.java
 ```
 
-The input classpath must contain compiled classes. This writes the transformed
-method body to `/tmp/out.java` and prints it to stdout; the output is not a
-complete Java class.
+The input classpath must contain compiled classes. Supplying the original source
+replaces the selected method and writes a complete transformed source file.
 
 ---
 
@@ -236,7 +237,7 @@ operations:
 
 ```bash
 cd /path/to/dbridge
-export JAVA_HOME="/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
+export JAVA_HOME="/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home"
 export PATH="$JAVA_HOME/bin:$PATH"
 
 bash examples/run.sh          # default: 50000 categories
@@ -284,16 +285,14 @@ method preserved the original result and log order.
 
 `examples/PartCountApp.java` is the original source. `examples/run.sh` first
 compiles it into `examples/build/original-classes`, analyzes that compiled class
-with DBridge, and writes the transformed method to
-`examples/build/computeTotal.java`. It replaces `computeTotal` in a generated
-source copy at `examples/build/PartCountApp.java`, then compiles that copy into
+with DBridge, and writes a source-preserving transformation to
+`examples/build/PartCountApp.java`, then compiles that class into
 `examples/build/optimized-classes`. The original and optimized applications are
 run from their separate class directories and their `RESULT` and `LOG_HASH`
 values are compared. All generated artifacts live under `examples/build`.
 
-The `.class` files in those directories are JVM bytecode, not Java source. VS
-Code may display them as decompiled Java, but DBridge itself analyzes the
-bytecode and `JavaWriter` emits only the transformed method body.
+The `.class` files in those directories are JVM bytecode, not Java source. DBridge
+analyzes the bytecode and replaces the transformed method in the original source.
 
 ---
 
@@ -303,8 +302,8 @@ bytecode and `JavaWriter` emits only the transformed method body.
 |---|---|
 | `JdbcDriverTest` | Fold detection (loop → `FoldNode`, 1 swallowed loop) |
 | `BodyRewriterTest` | Transformed Jimple contains `addBatch`/`executeBatch`/`getResultSet` |
-| `JavaWriterTest` | Transformed body renders as readable Java (while loop, batch + result calls) |
-| `DBridgeRuntimeTest` | Set-oriented rewrite correctness vs H2 (incl. LEFT JOIN zero-count), `mergeResults` by key, native INSERT batch |
+| `SootDavaTest` | Source-preserving transformed class contains the rewritten method |
+| `DBridgeRuntimeTest` | Set-oriented rewrite correctness vs H2 (incl. LEFT JOIN zero-count), duplicate/order-preserving merge, repeated execution, native INSERT batch |
 | `IntegrationTest` | Original vs transformed produce identical results on H2 |
 
 ---
@@ -319,8 +318,6 @@ bytecode and `JavaWriter` emits only the transformed method body.
   conditional/order-sensitive path currently batches inactive categories too
   and filters them during result consumption.
 - Nested loops are the next extension.
-- `JavaWriter` is a lightweight, best-effort Jimple-to-Java emitter for the
-  regular transformed shape. Its output is readable but may use Soot temporary
-  variable names and is a method body, not a complete class. Soot's Dava
-  decompiler, corresponding to the paper's "Decompile" step, does not run on
-  JDK 9+, so the custom emitter is used instead.
+- Source emission supports the regular paper-scope transformed method shape;
+  arbitrary Java control flow and overloaded-source method resolution are not
+  yet handled.

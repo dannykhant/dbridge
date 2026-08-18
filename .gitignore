@@ -94,3 +94,4 @@ nb-configuration.xml
 .agents/
 AGENTS.md
 output/
+opencode.json

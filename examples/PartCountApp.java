@@ -8,12 +8,18 @@ import java.sql.SQLException;
 import java.sql.Statement;
 
 /**
- * Original (iterative) JDBC application: computes the total number of parts
- * across a category and all its parent categories. Runs one query per category.
+ * Original (iterative) JDBC application exercising all five DBridge rewrite
+ * targets:
+ *   - statement reordering (loop-var update after the query)
+ *   - loop splitting (one query per category)
+ *   - query rewrite (scalar aggregate)
+ *   - conditional blocks (if isActive ...)
+ *   - order-sensitive operations (log() must observe iteration order)
  */
 public class PartCountApp {
 
     static final String URL = "jdbc:h2:mem:dbridge;DB_CLOSE_DELAY=-1";
+    static final StringBuilder LOG = new StringBuilder();
 
     public static void main(String[] args) throws Exception {
         int categories = args.length > 0 ? Integer.parseInt(args[0]) : 50000;
@@ -27,6 +33,7 @@ public class PartCountApp {
         long q1 = System.nanoTime();
 
         System.out.println("RESULT=" + total);
+        System.out.println("LOG_HASH=" + LOG.toString().hashCode());
         System.out.println("SETUP_MS=" + (t1 - t0) / 1_000_000);
         System.out.println("QUERY_MS=" + (q1 - q0) / 1_000_000);
     }
@@ -49,7 +56,16 @@ public class PartCountApp {
         }
     }
 
-    /** Iterative JDBC access: one round-trip per category. */
+    static boolean isActive(int category) {
+        return category % 2 == 0;
+    }
+
+    /** Order-sensitive side effect: appends in iteration order. */
+    static void log(int category, int partCount) {
+        LOG.append(category).append('=').append(partCount).append(',');
+    }
+
+    /** Iterative JDBC: one round-trip per active category. */
     public static int computeTotal(int startCategory) throws SQLException {
         Connection con = DriverManager.getConnection(URL);
         PreparedStatement pstmt = con.prepareStatement(
@@ -57,10 +73,14 @@ public class PartCountApp {
         int category = startCategory;
         int total = 0;
         while (category != -1) {
-            pstmt.setInt(1, category);
-            ResultSet rs = pstmt.executeQuery();
-            if (rs.next()) {
-                total += rs.getInt(1);
+            if (isActive(category)) {
+                pstmt.setInt(1, category);
+                ResultSet rs = pstmt.executeQuery();
+                if (rs.next()) {
+                    int partCount = rs.getInt(1);
+                    total += partCount;
+                    log(category, partCount);
+                }
             }
             category = category - 1;
         }

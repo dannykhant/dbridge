@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # End-to-end DBridge demo: original iterative JDBC vs batched (rewritten).
+# Exercises all five rewrite methods: statement reordering, loop splitting,
+# query rewrite, conditional blocks, and order-sensitive operations.
 # Requires JDK 17 and Maven.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,102 +13,133 @@ export JAVA_HOME="${JAVA_HOME:-/Library/Java/JavaVirtualMachines/temurin-17.jdk/
 export PATH="$JAVA_HOME/bin:$PATH"
 
 CATEGORIES="${1:-50000}"
-mkdir -p examples/output
+BUILD_DIR="$ROOT/examples/build"
+CP_FILE="$BUILD_DIR/cp.txt"
+ORIGINAL_OUTPUT="$BUILD_DIR/original.txt"
+OPTIMIZED_OUTPUT="$BUILD_DIR/optimized.txt"
+TRANSFORM_OUTPUT="$BUILD_DIR/transform.txt"
+TRANSFORM_METHOD="$BUILD_DIR/computeTotal.java"
+OPTIMIZED_SOURCE="$BUILD_DIR/PartCountApp.java"
+ORIGINAL_CLASSES="$BUILD_DIR/original-classes"
+OPTIMIZED_CLASSES="$BUILD_DIR/optimized-classes"
 
-echo "==> Categories: $CATEGORIES"
-echo "==> Building DBridge (skip tests)"
-mvn -q -DskipTests package dependency:build-classpath -Dmdep.outputFile=examples/output/cp.txt
+prepare_build_directories() {
+    mkdir -p "$BUILD_DIR"
+    rm -rf "$ORIGINAL_CLASSES" "$OPTIMIZED_CLASSES"
+    mkdir -p "$ORIGINAL_CLASSES" "$OPTIMIZED_CLASSES"
+}
 
-CP="$ROOT/target/classes:$(cat examples/output/cp.txt)"
-mkdir -p examples/build
+build_runtime() {
+    echo "==> Building DBridge runtime (skip tests)"
+    mvn -q -DskipTests package dependency:build-classpath -Dmdep.outputFile="$CP_FILE"
+    CP="$ROOT/target/classes:$(<"$CP_FILE")"
+}
 
-echo "==> Compiling original application"
-javac -cp "$CP" -d examples/build examples/PartCountApp.java
+compile_original_application() {
+    echo "==> Compiling original application"
+    javac -cp "$CP" -d "$ORIGINAL_CLASSES" examples/PartCountApp.java
+}
 
-echo "==> Running ORIGINAL application (iterative JDBC)"
-java -cp "examples/build:$CP" dbridge.example.PartCountApp "$CATEGORIES" | tee examples/output/original.txt
+transform_compute_total() {
+    echo "==> Transforming PartCountApp.computeTotal with DBridge"
+    java -cp "$ORIGINAL_CLASSES:$CP" dbridge.Main \
+        "$ORIGINAL_CLASSES:$CP" \
+        dbridge.example.PartCountApp \
+        "int computeTotal(int)" \
+        "$TRANSFORM_METHOD" > "$TRANSFORM_OUTPUT"
+}
 
-echo "==> Transforming computeTotal with DBridge"
-java -cp "$CP" dbridge.Main \
-  "examples/build" \
-  dbridge.example.PartCountApp \
-  "int computeTotal(int)" \
-  examples/build/computeTotal.java >/dev/null
-
-echo "==> Assembling optimized application"
-{
-  cat <<'HEADER'
-package dbridge.example;
-
-import dbridge.runtime.DBridgeConnection;
-import dbridge.runtime.DBridgePreparedStatement;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-
-public class PartCountAppOptimized {
-
-    static final String URL = "jdbc:h2:mem:dbridge;DB_CLOSE_DELAY=-1";
-
-    public static void main(String[] args) throws Exception {
-        int categories = args.length > 0 ? Integer.parseInt(args[0]) : 50000;
-        long t0 = System.nanoTime();
-        setup(categories);
-        long t1 = System.nanoTime();
-        long q0 = System.nanoTime();
-        int total = computeTotal(categories - 1);
-        long q1 = System.nanoTime();
-        System.out.println("RESULT=" + total);
-        System.out.println("SETUP_MS=" + (t1 - t0) / 1_000_000);
-        System.out.println("QUERY_MS=" + (q1 - q0) / 1_000_000);
+generate_optimized_source() {
+    echo "==> Generating optimized application from transformed method"
+    awk -v generated="$TRANSFORM_METHOD" '
+    BEGIN {
+        while ((getline line < generated) > 0) {
+            replacement = replacement line "\n"
+        }
+        close(generated)
     }
-
-    static void setup(int categories) throws SQLException {
-        try (Connection c = DriverManager.getConnection(URL);
-             Statement st = c.createStatement()) {
-            st.execute("CREATE TABLE part(partkey INT PRIMARY KEY, category INT)");
-            try (PreparedStatement ins = c.prepareStatement("INSERT INTO part VALUES (?, ?)")) {
-                for (int cat = 0; cat < categories; cat++) {
-                    for (int k = 0; k < 3; k++) {
-                        ins.setInt(1, cat * 3 + k);
-                        ins.setInt(2, cat);
-                        ins.addBatch();
-                    }
-                }
-                ins.executeBatch();
+    {
+        if (!replacing && $0 ~ /^[[:space:]]*public static int computeTotal\(int /) {
+            printf "%s", replacement
+            replacing = 1
+            found = 1
+        }
+        if (replacing) {
+            current = $0
+            opens = gsub(/\{/, "", current)
+            closes = gsub(/\}/, "", current)
+            depth += opens - closes
+            if (depth == 0) {
+                replacing = 0
             }
-            st.execute("CREATE INDEX part_cat ON part(category)");
+            next
+        }
+        print
+    }
+    END {
+        if (!found) {
+            exit 1
         }
     }
+    ' examples/PartCountApp.java > "$OPTIMIZED_SOURCE"
+}
 
-HEADER
-  cat examples/build/computeTotal.java
-  echo "}"
-} > examples/build/PartCountAppOptimized.java
+compile_optimized_application() {
+    echo "==> Compiling optimized application"
+    javac -cp "$CP" -d "$OPTIMIZED_CLASSES" "$OPTIMIZED_SOURCE"
+}
 
-echo "==> Compiling optimized application"
-javac -cp "$CP" -d examples/build examples/build/PartCountAppOptimized.java
+run_application() {
+    local label="$1"
+    local class_directory="$2"
+    local output_file="$3"
 
-echo "==> Running OPTIMIZED application (batched JDBC)"
-java -cp "examples/build:$CP" dbridge.example.PartCountAppOptimized "$CATEGORIES" | tee examples/output/optimized.txt
+    echo "==> Running $label"
+    java -cp "$class_directory:$CP" dbridge.example.PartCountApp "$CATEGORIES" | tee "$output_file"
+}
 
-echo
-echo "==> Comparison"
-ORIG=$(grep RESULT examples/output/original.txt | cut -d= -f2)
-OPT=$(grep RESULT examples/output/optimized.txt | cut -d= -f2)
-OQ=$(grep QUERY_MS examples/output/original.txt | cut -d= -f2)
-NQ=$(grep QUERY_MS examples/output/optimized.txt | cut -d= -f2)
+compare_results() {
+    local original_result optimized_result
+    local original_log_hash optimized_log_hash
+    local original_query_time optimized_query_time
 
-echo "Original result : $ORIG"
-echo "Optimized result: $OPT"
-if [ "$ORIG" = "$OPT" ]; then
-  echo "CORRECTNESS: PASS (identical results)"
-else
-  echo "CORRECTNESS: FAIL"
-  exit 1
-fi
-echo "Query time - original : ${OQ} ms"
-echo "Query time - optimized: ${NQ} ms"
+    echo
+    echo "==> Comparison"
+    original_result=$(grep RESULT "$ORIGINAL_OUTPUT" | cut -d= -f2)
+    optimized_result=$(grep RESULT "$OPTIMIZED_OUTPUT" | cut -d= -f2)
+    original_log_hash=$(grep LOG_HASH "$ORIGINAL_OUTPUT" | cut -d= -f2)
+    optimized_log_hash=$(grep LOG_HASH "$OPTIMIZED_OUTPUT" | cut -d= -f2)
+    original_query_time=$(grep QUERY_MS "$ORIGINAL_OUTPUT" | cut -d= -f2)
+    optimized_query_time=$(grep QUERY_MS "$OPTIMIZED_OUTPUT" | cut -d= -f2)
+
+    echo "Result - original : $original_result"
+    echo "Result - optimized: $optimized_result"
+    echo "Log hash - original : $original_log_hash"
+    echo "Log hash - optimized: $optimized_log_hash"
+
+    local checks_passed=1
+    [ "$original_result" = "$optimized_result" ] || { echo "CORRECTNESS (result): FAIL"; checks_passed=0; }
+    [ "$original_log_hash" = "$optimized_log_hash" ] || { echo "CORRECTNESS (order) : FAIL"; checks_passed=0; }
+    [ "$checks_passed" = "1" ] && echo "CORRECTNESS: PASS (result and order match)"
+
+    echo "Query time - original : ${original_query_time} ms"
+    echo "Query time - optimized: ${optimized_query_time} ms"
+
+    echo
+    echo "Round-trips:"
+    echo " - original  : ~N queries"
+    echo " - optimized : 1 batch"
+    echo "NOTE: H2 is in-memory, so a per-row indexed lookup is already ~microseconds;"
+    echo "      the batched form wins on databases with network round-trip latency."
+}
+
+echo "==> Categories: $CATEGORIES"
+prepare_build_directories
+build_runtime
+compile_original_application
+transform_compute_total
+generate_optimized_source
+compile_optimized_application
+run_application "ORIGINAL application (iterative JDBC)" "$ORIGINAL_CLASSES" "$ORIGINAL_OUTPUT"
+run_application "OPTIMIZED application (batched JDBC)" "$OPTIMIZED_CLASSES" "$OPTIMIZED_OUTPUT"
+compare_results

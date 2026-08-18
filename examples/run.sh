@@ -4,12 +4,12 @@ set -euo pipefail
 # End-to-end DBridge demo: original iterative JDBC vs batched (rewritten).
 # Exercises all five rewrite methods: statement reordering, loop splitting,
 # query rewrite, conditional blocks, and order-sensitive operations.
-# Requires JDK 17 and Maven.
+# Requires JDK 8 and Maven.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-export JAVA_HOME="${JAVA_HOME:-/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home}"
+export JAVA_HOME="${JAVA_HOME:-/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home}"
 export PATH="$JAVA_HOME/bin:$PATH"
 
 CATEGORIES="${1:-50000}"
@@ -18,7 +18,7 @@ CP_FILE="$BUILD_DIR/cp.txt"
 ORIGINAL_OUTPUT="$BUILD_DIR/original.txt"
 OPTIMIZED_OUTPUT="$BUILD_DIR/optimized.txt"
 TRANSFORM_OUTPUT="$BUILD_DIR/transform.txt"
-TRANSFORM_METHOD="$BUILD_DIR/computeTotal.java"
+TRANSFORM_SOURCE="$BUILD_DIR/transformed-PartCountApp.java"
 OPTIMIZED_SOURCE="$BUILD_DIR/PartCountApp.java"
 ORIGINAL_CLASSES="$BUILD_DIR/original-classes"
 OPTIMIZED_CLASSES="$BUILD_DIR/optimized-classes"
@@ -37,7 +37,7 @@ build_runtime() {
 
 compile_original_application() {
     echo "==> Compiling original application"
-    javac -cp "$CP" -d "$ORIGINAL_CLASSES" examples/PartCountApp.java
+    javac -source 1.8 -target 1.8 -cp "$CP" -d "$ORIGINAL_CLASSES" examples/PartCountApp.java
 }
 
 transform_compute_total() {
@@ -46,47 +46,17 @@ transform_compute_total() {
         "$ORIGINAL_CLASSES:$CP" \
         dbridge.example.PartCountApp \
         "int computeTotal(int)" \
-        "$TRANSFORM_METHOD" > "$TRANSFORM_OUTPUT"
+        "$TRANSFORM_SOURCE" examples/PartCountApp.java > "$TRANSFORM_OUTPUT"
 }
 
 generate_optimized_source() {
-    echo "==> Generating optimized application from transformed method"
-    awk -v generated="$TRANSFORM_METHOD" '
-    BEGIN {
-        while ((getline line < generated) > 0) {
-            replacement = replacement line "\n"
-        }
-        close(generated)
-    }
-    {
-        if (!replacing && $0 ~ /^[[:space:]]*public static int computeTotal\(int /) {
-            printf "%s", replacement
-            replacing = 1
-            found = 1
-        }
-        if (replacing) {
-            current = $0
-            opens = gsub(/\{/, "", current)
-            closes = gsub(/\}/, "", current)
-            depth += opens - closes
-            if (depth == 0) {
-                replacing = 0
-            }
-            next
-        }
-        print
-    }
-    END {
-        if (!found) {
-            exit 1
-        }
-    }
-    ' examples/PartCountApp.java > "$OPTIMIZED_SOURCE"
+    echo "==> Using source-preserving transformed application source"
+    cp "$TRANSFORM_SOURCE" "$OPTIMIZED_SOURCE"
 }
 
 compile_optimized_application() {
     echo "==> Compiling optimized application"
-    javac -cp "$CP" -d "$OPTIMIZED_CLASSES" "$OPTIMIZED_SOURCE"
+    javac -source 1.8 -target 1.8 -cp "$CP" -d "$OPTIMIZED_CLASSES" "$OPTIMIZED_SOURCE"
 }
 
 run_application() {

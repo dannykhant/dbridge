@@ -1,10 +1,10 @@
 # Part Count Examples
 
 `PartCountApp.java` is the iterative JDBC program. `run.sh` invokes DBridge on
-its `computeTotal(int)` method and writes the generated method to
-`examples/build/computeTotal.java`. It then replaces that method in a copy of
-the original source and compiles the generated application into a separate
-class directory. No optimized source is compiled before the transformation.
+its `computeTotal(int)` method and writes a source-preserving transformed class to
+`examples/build/transformed-PartCountApp.java`. That source is copied to
+`examples/build/PartCountApp.java` and compiled into a separate class directory.
+No optimized source is compiled before the transformation.
 
 The mapping is:
 
@@ -41,8 +41,7 @@ results are written to `examples/build/`.
 The files under `original-classes/` and `optimized-classes/` are compiled JVM
 bytecode (`.class` files). VS Code may display them as readable Java through
 its decompiler; the files themselves remain binary class files. The generated
-Java source is stored separately as `computeTotal.java` and the optimized
-application source copy.
+Java source is stored separately from the original application source.
 
 Expected correctness checks:
 

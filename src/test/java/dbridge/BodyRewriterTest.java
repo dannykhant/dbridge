@@ -29,7 +29,6 @@ public class BodyRewriterTest {
         String result = fsa.getBody().toString();
         assertTrue(result.contains("addBatch"), "should contain addBatch");
         assertTrue(result.contains("executeBatch"), "should contain executeBatch");
-        assertTrue(result.contains("getMoreResults"), "should contain getMoreResults");
         assertTrue(result.contains("getResultSet"), "should contain getResultSet");
         assertTrue(result.contains("DBridgeConnection"), "should route connection through runtime");
     }

@@ -1,6 +1,5 @@
 package dbridge.rewrite;
 
-import dbridge.analysis.region.regions.ARegion;
 import dbridge.analysis.region.regions.LoopRegion;
 import soot.Body;
 import soot.BooleanType;
@@ -13,16 +12,22 @@ import soot.SootMethodRef;
 import soot.Unit;
 import soot.Value;
 import soot.VoidType;
-import soot.jimple.AssignStmt;
 import soot.jimple.AddExpr;
+import soot.jimple.AssignStmt;
+import soot.jimple.ConditionExpr;
 import soot.jimple.IfStmt;
 import soot.jimple.InstanceInvokeExpr;
 import soot.jimple.IntConstant;
 import soot.jimple.InvokeExpr;
 import soot.jimple.InvokeStmt;
 import soot.jimple.Jimple;
-import soot.jimple.StringConstant;
 import soot.jimple.StaticInvokeExpr;
+import soot.jimple.StringConstant;
+import soot.jimple.Stmt;
+import soot.jimple.SubExpr;
+import soot.jimple.toolkits.annotation.logic.Loop;
+import soot.jimple.toolkits.annotation.logic.LoopFinder;
+import soot.toolkits.graph.BriefUnitGraph;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -32,8 +37,10 @@ import java.util.Set;
 
 /**
  * Rewrites a Soot method body to replace iterative JDBC access with batched
- * (set-oriented) access: splits each swallowed loop into a parameter-binding
- * loop, an {@code executeBatch()} call, and a result-consumption loop.
+ * (set-oriented) access. Handles both the simple case (loop splitting + query
+ * rewrite) and the conditional/order-sensitive case (guarded statements +
+ * LoopContextTable), using Soot's {@link LoopFinder} for robust loop
+ * identification.
  */
 public class BodyRewriter {
 
@@ -50,16 +57,17 @@ public class BodyRewriter {
 
     public void rewriteBody() {
         rewriteJdbcSetup();
-        for (LoopRegion loop : loopsSwallowed) {
-            splitLoop(loop);
+        BriefUnitGraph ug = new BriefUnitGraph(body);
+        LoopFinder loopFinder = new LoopFinder();
+        for (Loop loop : loopFinder.getLoops(ug)) {
+            transformLoop(loop);
         }
     }
 
-    /**
-     * Route the JDBC setup through the DBridge runtime: replace
-     * {@code DriverManager.getConnection} with {@code DBridgeConnection.getConnection}
-     * and retype the prepared statement to {@code DBridgePreparedStatement}.
-     */
+    // ------------------------------------------------------------------
+    // JDBC setup routing
+    // ------------------------------------------------------------------
+
     private void rewriteJdbcSetup() {
         for (Unit unit : body.getUnits()) {
             if (!(unit instanceof AssignStmt)) {
@@ -106,118 +114,184 @@ public class BodyRewriter {
         assign.setRightOp(Jimple.v().newVirtualInvokeExpr((Local) invoke.getBase(), ref, invoke.getArgs()));
     }
 
-    private void splitLoop(LoopRegion loop) {
-        ARegion headRegion = loop.getSubRegions().get(0);
-        ARegion bodyRegion = loop.getSubRegions().get(1);
+    // ------------------------------------------------------------------
+    // Loop classification
+    // ------------------------------------------------------------------
 
-        IfStmt loopCond = null;
-        for (Unit unit : headRegion.getUnits()) {
-            if (unit instanceof IfStmt) {
-                loopCond = (IfStmt) unit;
+    private static final class Parts {
+        IfStmt headIf;
+        Unit exitTarget;
+        Unit headConst;
+        Unit condAssign;
+        IfStmt outerIf;
+        Unit binding;
+        Unit queryExec;
+        Unit nextStmt;
+        IfStmt innerIf;
+        Unit getIntStmt;
+        Unit accumulate;
+        Unit orderSensitive;
+        Unit loopVarUpdate;
+        Local pstmt;
+        Local rs;
+        Local nextResult;
+        Local resultVal;
+        Local agg;
+        Local loopVar;
+        Local flag;
+        boolean conditional;
+    }
+
+    private Parts classify(Loop loop) {
+        List<Stmt> stmts = new ArrayList<>(loop.getLoopStatements());
+        stmts.sort((a, b) -> indexOf(a) - indexOf(b));
+
+        Parts p = new Parts();
+        for (Stmt s : loop.getLoopExits()) {
+            if (s instanceof IfStmt) {
+                p.headIf = (IfStmt) s;
                 break;
             }
         }
-        if (loopCond == null) {
-            return;
+        if (p.headIf == null) {
+            return null;
         }
+        p.exitTarget = p.headIf.getTarget();
 
-        List<Unit> bindingStmts = new ArrayList<>();
-        Unit queryExec = null;
-        Unit nextStmt = null;
-        Unit ifNext = null;
-        Unit getIntStmt = null;
-        Unit accumulate = null;
-
-        List<Unit> bodyUnits = bodyRegion.getUnits();
-        for (Unit unit : bodyUnits) {
-            if (unit instanceof InvokeStmt) {
-                InvokeExpr invoke = ((InvokeStmt) unit).getInvokeExpr();
-                if (BIND_METHODS.contains(invoke.getMethod().getName())) {
-                    bindingStmts.add(unit);
+        boolean pastHead = false;
+        for (Stmt s : stmts) {
+            if (s == p.headIf) {
+                pastHead = true;
+                continue;
+            }
+            if (!pastHead) {
+                if (s instanceof AssignStmt) {
+                    p.headConst = s;
                 }
-            } else if (unit instanceof AssignStmt) {
-                AssignStmt assign = (AssignStmt) unit;
-                Value right = assign.getRightOp();
-                if (right instanceof InvokeExpr) {
-                    String method = ((InvokeExpr) right).getMethod().getName();
-                    if (method.equals("executeQuery")) {
-                        queryExec = unit;
-                    } else if (method.equals("next")) {
-                        nextStmt = unit;
-                    } else if (method.equals("getInt") || method.equals("getLong") || method.equals("getString")) {
-                        getIntStmt = unit;
+                continue;
+            }
+            if (s instanceof IfStmt) {
+                IfStmt ifs = (IfStmt) s;
+                if (p.condAssign != null && usesCondition(ifs, (Local) ((AssignStmt) p.condAssign).getLeftOp())) {
+                    p.outerIf = ifs;
+                } else {
+                    p.innerIf = ifs;
+                }
+            } else if (s instanceof InvokeStmt) {
+                InvokeExpr ie = ((InvokeStmt) s).getInvokeExpr();
+                if (BIND_METHODS.contains(ie.getMethod().getName())) {
+                    p.binding = s;
+                } else {
+                    p.orderSensitive = s;
+                }
+            } else if (s instanceof AssignStmt) {
+                AssignStmt as = (AssignStmt) s;
+                Value r = as.getRightOp();
+                if (r instanceof InstanceInvokeExpr) {
+                    String m = ((InstanceInvokeExpr) r).getMethod().getName();
+                    if (m.equals("executeQuery")) {
+                        p.queryExec = s;
+                    } else if (m.equals("next")) {
+                        p.nextStmt = s;
+                    } else if (m.equals("getInt") || m.equals("getLong") || m.equals("getString")) {
+                        p.getIntStmt = s;
                     }
-                } else if (right instanceof AddExpr) {
-                    accumulate = unit;
+                } else if (r instanceof StaticInvokeExpr) {
+                    if (((AssignStmt) s).getLeftOp().getType() instanceof BooleanType) {
+                        p.condAssign = s;
+                    } else {
+                        p.loopVarUpdate = s;
+                    }
+                } else if (r instanceof AddExpr) {
+                    p.accumulate = s;
+                } else if (r instanceof SubExpr) {
+                    p.loopVarUpdate = s;
                 }
-            } else if (unit instanceof IfStmt) {
-                ifNext = unit;
             }
         }
 
-        if (queryExec == null || nextStmt == null || getIntStmt == null || accumulate == null) {
+        if (p.queryExec == null || p.nextStmt == null || p.getIntStmt == null || p.accumulate == null
+                || p.loopVarUpdate == null || p.binding == null) {
+            return null;
+        }
+
+        p.pstmt = (Local) ((InstanceInvokeExpr) ((InvokeStmt) p.binding).getInvokeExpr()).getBase();
+        p.rs = (Local) ((AssignStmt) p.queryExec).getLeftOp();
+        p.nextResult = (Local) ((AssignStmt) p.nextStmt).getLeftOp();
+        p.resultVal = (Local) ((AssignStmt) p.getIntStmt).getLeftOp();
+        p.agg = (Local) ((AssignStmt) p.accumulate).getLeftOp();
+        p.loopVar = (Local) ((AssignStmt) p.loopVarUpdate).getLeftOp();
+        p.flag = p.condAssign != null ? (Local) ((AssignStmt) p.condAssign).getLeftOp() : null;
+
+        p.conditional = p.condAssign != null || p.orderSensitive != null;
+        return p;
+    }
+
+    private boolean usesCondition(IfStmt ifs, Local condLocal) {
+        Value c = ifs.getCondition();
+        if (c instanceof ConditionExpr) {
+            ConditionExpr ce = (ConditionExpr) c;
+            return ce.getOp1().equals(condLocal) || ce.getOp2().equals(condLocal);
+        }
+        return false;
+    }
+
+    private int indexOf(Unit u) {
+        int i = 0;
+        for (Unit x : body.getUnits()) {
+            if (x == u) {
+                return i;
+            }
+            i++;
+        }
+        return Integer.MAX_VALUE;
+    }
+
+    // ------------------------------------------------------------------
+    // Transformation dispatch
+    // ------------------------------------------------------------------
+
+    private void transformLoop(Loop loop) {
+        Parts p = classify(loop);
+        if (p == null) {
             return;
         }
-
-        Local pstmt = (Local) ((InstanceInvokeExpr) ((AssignStmt) queryExec).getRightOp()).getBase();
-        Local rs = (Local) ((AssignStmt) queryExec).getLeftOp();
-        Local nextResult = (Local) ((AssignStmt) nextStmt).getLeftOp();
-        Local resultVal = (Local) ((AssignStmt) getIntStmt).getLeftOp();
-        Local agg = (Local) ((AssignStmt) accumulate).getLeftOp();
-
-        // Insert addBatch after each binding statement.
-        SootClass dbps = resolve("dbridge.runtime.DBridgePreparedStatement");
-        for (Unit binding : bindingStmts) {
-            InvokeStmt invokeStmt = (InvokeStmt) binding;
-            InstanceInvokeExpr oldInvoke = (InstanceInvokeExpr) invokeStmt.getInvokeExpr();
-            SootMethodRef setRef = Scene.v().makeMethodRef(dbps, oldInvoke.getMethod().getName(),
-                    oldInvoke.getMethod().getParameterTypes(), VoidType.v(), false);
-            Local base = (Local) oldInvoke.getBase();
-            invokeStmt.setInvokeExpr(Jimple.v().newVirtualInvokeExpr(base, setRef, oldInvoke.getArgs()));
-
-            SootMethodRef addBatchRef = Scene.v().makeMethodRef(dbps, "addBatch",
-                    List.of(), VoidType.v(), false);
-            body.getUnits().insertAfter(Jimple.v().newInvokeStmt(
-                    Jimple.v().newVirtualInvokeExpr(base, addBatchRef, new ArrayList<Value>())), binding);
+        if (p.conditional) {
+            transformConditionalLoop(loop, p);
+        } else {
+            transformSimpleLoop(loop, p);
         }
+    }
 
-        // Remove result-consumption statements from the loop body.
-        for (Unit unit : new Unit[]{queryExec, nextStmt, ifNext, getIntStmt, accumulate}) {
+    // ------------------------------------------------------------------
+    // Simple path: loop splitting + query rewrite
+    // ------------------------------------------------------------------
+
+    private void transformSimpleLoop(Loop loop, Parts p) {
+        SootClass dbps = resolve("dbridge.runtime.DBridgePreparedStatement");
+
+        // addBatch after each binding
+        InvokeStmt binding = (InvokeStmt) p.binding;
+        InstanceInvokeExpr oldInvoke = (InstanceInvokeExpr) binding.getInvokeExpr();
+        SootMethodRef setRef = Scene.v().makeMethodRef(dbps, oldInvoke.getMethod().getName(),
+                oldInvoke.getMethod().getParameterTypes(), VoidType.v(), false);
+        Local base = (Local) oldInvoke.getBase();
+        binding.setInvokeExpr(Jimple.v().newVirtualInvokeExpr(base, setRef, oldInvoke.getArgs()));
+        SootMethodRef addBatchRef = Scene.v().makeMethodRef(dbps, "addBatch", List.of(), VoidType.v(), false);
+        body.getUnits().insertAfter(Jimple.v().newInvokeStmt(
+                Jimple.v().newVirtualInvokeExpr(base, addBatchRef, new ArrayList<Value>())), binding);
+
+        for (Unit unit : new Unit[]{p.queryExec, p.nextStmt, p.innerIf, p.getIntStmt, p.accumulate}) {
             if (unit != null) {
                 body.getUnits().remove(unit);
             }
         }
 
-        // Determine the loop exit robustly for both Jimple loop forms:
-        //   while form:  if (cond) goto exit;  body;  goto head   -> target == exit
-        //   do-while form: goto head; body; if (!cond) goto body  -> fall-through == exit
-        // The exit is whichever of the condition's target / successor is not part
-        // of the loop body.
-        Unit exitTarget = null;
-        Unit condTarget = loopCond.getTarget();
-        Unit condSucc = null;
-        try {
-            condSucc = body.getUnits().getSuccOf(loopCond);
-        } catch (RuntimeException ignored) {
-            // loopCond is the last unit; only the target matters.
-        }
-        if (condTarget != null && !bodyUnits.contains(condTarget)) {
-            exitTarget = condTarget;
-        } else if (condSucc != null && !bodyUnits.contains(condSucc)) {
-            exitTarget = condSucc;
-        }
-        if (exitTarget == null) {
-            return;
-        }
-
-        // Build the batch + result loop and insert before the loop exit.
-        List<Unit> newUnits = buildBatchAndResultLoop(pstmt, rs, nextResult, resultVal, agg, exitTarget);
+        List<Unit> newUnits = buildBatchAndResultLoop(p.pstmt, p.rs, p.nextResult, p.resultVal, p.agg, p.exitTarget);
         for (Unit newUnit : newUnits) {
-            body.getUnits().insertBefore(newUnit, exitTarget);
+            body.getUnits().insertBefore(newUnit, p.exitTarget);
         }
-        // insertBefore redirects branches that target the anchor, so re-assert
-        // the exit target of the "no more results" branch.
-        ((IfStmt) newUnits.get(2)).setTarget(exitTarget);
+        ((IfStmt) newUnits.get(3)).setTarget(p.exitTarget);
     }
 
     private List<Unit> buildBatchAndResultLoop(Local pstmt, Local rs, Local nextResult,
@@ -227,8 +301,6 @@ public class BodyRewriter {
 
         SootMethodRef executeBatchRef = Scene.v().makeMethodRef(dbps, "executeBatch",
                 List.of(), VoidType.v(), false);
-        SootMethodRef getMoreResultsRef = Scene.v().makeMethodRef(dbps, "getMoreResults",
-                List.of(), BooleanType.v(), false);
         SootMethodRef getResultSetRef = Scene.v().makeMethodRef(dbps, "getResultSet",
                 List.of(), RefType.v("java.sql.ResultSet"), false);
         SootMethodRef rsNextRef = Scene.v().makeMethodRef(rsClass, "next",
@@ -237,39 +309,190 @@ public class BodyRewriter {
                 List.of(IntType.v()), IntType.v(), false);
 
         List<Unit> units = new ArrayList<>();
-
-        Unit executeBatch = Jimple.v().newInvokeStmt(
-                Jimple.v().newVirtualInvokeExpr(pstmt, executeBatchRef, new ArrayList<Value>()));
-        units.add(executeBatch);
-
-        Unit getMoreResults = Jimple.v().newAssignStmt(nextResult,
-                Jimple.v().newVirtualInvokeExpr(pstmt, getMoreResultsRef, new ArrayList<Value>()));
-        units.add(getMoreResults);
-
-        IfStmt ifNoMore = Jimple.v().newIfStmt(Jimple.v().newEqExpr(nextResult, IntConstant.v(0)), exitTarget);
-        units.add(ifNoMore);
-
-        Unit getResultSet = Jimple.v().newAssignStmt(rs,
-                Jimple.v().newVirtualInvokeExpr(pstmt, getResultSetRef, new ArrayList<Value>()));
-        units.add(getResultSet);
-
+        units.add(Jimple.v().newInvokeStmt(
+                Jimple.v().newVirtualInvokeExpr(pstmt, executeBatchRef, new ArrayList<Value>())));
+        units.add(Jimple.v().newAssignStmt(rs,
+                Jimple.v().newVirtualInvokeExpr(pstmt, getResultSetRef, new ArrayList<Value>())));
         Unit rsNext = Jimple.v().newAssignStmt(nextResult,
                 Jimple.v().newInterfaceInvokeExpr(rs, rsNextRef, new ArrayList<Value>()));
         units.add(rsNext);
+        units.add(Jimple.v().newIfStmt(Jimple.v().newEqExpr(nextResult, IntConstant.v(0)), exitTarget));
+        units.add(Jimple.v().newAssignStmt(resultVal,
+                Jimple.v().newInterfaceInvokeExpr(rs, rsGetIntRef, List.of(IntConstant.v(1)))));
+        units.add(Jimple.v().newAssignStmt(agg, Jimple.v().newAddExpr(agg, resultVal)));
+        units.add(Jimple.v().newGotoStmt(rsNext));
+        return units;
+    }
 
-        IfStmt ifNextEmpty = Jimple.v().newIfStmt(Jimple.v().newEqExpr(nextResult, IntConstant.v(0)), getMoreResults);
-        units.add(ifNextEmpty);
+    // ------------------------------------------------------------------
+    // Conditional + order-sensitive path (the paper's Example 3 -> 4)
+    // ------------------------------------------------------------------
 
-        Unit getInt = Jimple.v().newAssignStmt(resultVal,
-                Jimple.v().newInterfaceInvokeExpr(rs, rsGetIntRef, List.of(IntConstant.v(1))));
-        units.add(getInt);
+    private void transformConditionalLoop(Loop loop, Parts p) {
+        SootClass dbps = resolve("dbridge.runtime.DBridgePreparedStatement");
+        SootClass lct = resolve("dbridge.runtime.LoopContextTable");
 
-        Unit accumulate = Jimple.v().newAssignStmt(agg, Jimple.v().newAddExpr(agg, resultVal));
-        units.add(accumulate);
+        // 1. ctx = new LoopContextTable() before the loop.
+        Local ctx = Jimple.v().newLocal("ctx", RefType.v("dbridge.runtime.LoopContextTable"));
+        body.getLocals().add(ctx);
+        SootMethodRef lctInit = Scene.v().makeMethodRef(lct, "<init>", List.of(), VoidType.v(), false);
+        Unit newLct = Jimple.v().newAssignStmt(ctx,
+                Jimple.v().newNewExpr(RefType.v("dbridge.runtime.LoopContextTable")));
+        Unit callInit = Jimple.v().newInvokeStmt(Jimple.v().newSpecialInvokeExpr(ctx, lctInit));
+        Unit loopHead = loop.getHead();
+        Unit beforeLoop = body.getUnits().getPredOf(loopHead);
+        if (beforeLoop == null) {
+            body.getUnits().insertBefore(newLct, loopHead);
+            body.getUnits().insertBefore(callInit, loopHead);
+        } else {
+            body.getUnits().insertAfter(newLct, beforeLoop);
+            body.getUnits().insertAfter(callInit, newLct);
+        }
 
-        units.add(Jimple.v().newGotoStmt(getMoreResults));
+        // 2. tempCat = loopVar before the loop-var update.
+        Local tempCat = Jimple.v().newLocal("tempCat", IntType.v());
+        body.getLocals().add(tempCat);
+        Unit tempAssign = Jimple.v().newAssignStmt(tempCat, p.loopVar);
+        body.getUnits().insertBefore(tempAssign, p.loopVarUpdate);
+
+        // 3. addBatch after the binding (guarded block).
+        InvokeStmt binding = (InvokeStmt) p.binding;
+        InstanceInvokeExpr oldInvoke = (InstanceInvokeExpr) binding.getInvokeExpr();
+        SootMethodRef setRef = Scene.v().makeMethodRef(dbps, oldInvoke.getMethod().getName(),
+                oldInvoke.getMethod().getParameterTypes(), VoidType.v(), false);
+        Local base = (Local) oldInvoke.getBase();
+        binding.setInvokeExpr(Jimple.v().newVirtualInvokeExpr(base, setRef, oldInvoke.getArgs()));
+        SootMethodRef addBatchRef = Scene.v().makeMethodRef(dbps, "addBatch", List.of(), VoidType.v(), false);
+        body.getUnits().insertAfter(Jimple.v().newInvokeStmt(
+                Jimple.v().newVirtualInvokeExpr(base, addBatchRef, new ArrayList<Value>())), binding);
+
+        // Keep inactive records in the batch. The result loop filters them while
+        // retaining the original iteration order for order-sensitive operations.
+        if (p.outerIf != null) {
+            body.getUnits().remove(p.outerIf);
+        }
+
+        // 5. ctx.addRecord(tempCat, flag, tempCat) after the loop-var update.
+        SootMethodRef addRecordRef = Scene.v().makeMethodRef(lct, "addRecord",
+                List.of(IntType.v(), BooleanType.v(), IntType.v()), VoidType.v(), false);
+        Unit addRecord = Jimple.v().newInvokeStmt(Jimple.v().newVirtualInvokeExpr(ctx, addRecordRef,
+                List.of(tempCat, p.flag, tempCat)));
+        body.getUnits().insertAfter(addRecord, p.loopVarUpdate);
+
+        // 6. Remove the query/result/order-sensitive statements from the loop.
+        for (Unit unit : new Unit[]{p.queryExec, p.nextStmt, p.innerIf, p.getIntStmt, p.accumulate, p.orderSensitive}) {
+            if (unit != null) {
+                body.getUnits().remove(unit);
+            }
+        }
+
+        // 7. executeBatch + mergeResults + result loop before the loop exit.
+        List<Unit> newUnits = buildCtxResultLoop(ctx, p, p.exitTarget);
+        for (Unit newUnit : newUnits) {
+            body.getUnits().insertBefore(newUnit, p.exitTarget);
+        }
+        ((IfStmt) newUnits.get(4)).setTarget(p.exitTarget);
+    }
+
+    private List<Unit> buildCtxResultLoop(Local ctx, Parts p, Unit exitTarget) {
+        SootClass dbps = resolve("dbridge.runtime.DBridgePreparedStatement");
+        SootClass lct = resolve("dbridge.runtime.LoopContextTable");
+        SootClass rec = resolve("dbridge.runtime.Record");
+        SootClass iter = resolve("java.util.Iterator");
+
+        SootMethodRef executeBatchRef = Scene.v().makeMethodRef(dbps, "executeBatch",
+                List.of(), VoidType.v(), false);
+        SootMethodRef mergeRef = Scene.v().makeMethodRef(lct, "mergeResults",
+                List.of(RefType.v("dbridge.runtime.DBridgePreparedStatement")), VoidType.v(), false);
+        SootMethodRef iteratorRef = Scene.v().makeMethodRef(lct, "iterator",
+                List.of(), RefType.v("java.util.Iterator"), false);
+        SootMethodRef hasNextRef = Scene.v().makeMethodRef(iter, "hasNext",
+                List.of(), BooleanType.v(), false);
+        SootMethodRef nextRef = Scene.v().makeMethodRef(iter, "next",
+                List.of(), RefType.v("java.lang.Object"), false);
+        SootMethodRef getIntRef = Scene.v().makeMethodRef(rec, "getInt",
+                List.of(IntType.v()), IntType.v(), false);
+        SootMethodRef getBoolRef = Scene.v().makeMethodRef(rec, "getBoolean",
+                List.of(IntType.v()), BooleanType.v(), false);
+
+        Local it = Jimple.v().newLocal("it", RefType.v("java.util.Iterator"));
+        Local nextObject = Jimple.v().newLocal("nextObject", RefType.v("java.lang.Object"));
+        Local record = Jimple.v().newLocal("record", RefType.v("dbridge.runtime.Record"));
+        Local has = Jimple.v().newLocal("has", BooleanType.v());
+        body.getLocals().add(it);
+        body.getLocals().add(nextObject);
+        body.getLocals().add(record);
+        body.getLocals().add(has);
+
+        List<Unit> units = new ArrayList<>();
+
+        // executeBatch()
+        units.add(Jimple.v().newInvokeStmt(
+                Jimple.v().newVirtualInvokeExpr(p.pstmt, executeBatchRef, new ArrayList<Value>())));
+        // ctx.mergeResults(pstmt)
+        units.add(Jimple.v().newInvokeStmt(
+                Jimple.v().newVirtualInvokeExpr(ctx, mergeRef, List.of(p.pstmt))));
+        // it = ctx.iterator()
+        units.add(Jimple.v().newAssignStmt(it,
+                Jimple.v().newVirtualInvokeExpr(ctx, iteratorRef, new ArrayList<Value>())));
+
+        // loop head: has = it.hasNext()
+        Unit hasNext = Jimple.v().newAssignStmt(has,
+                Jimple.v().newInterfaceInvokeExpr(it, hasNextRef, new ArrayList<Value>()));
+        units.add(hasNext);
+
+        // if has == 0 goto exit
+        IfStmt ifNoMore = Jimple.v().newIfStmt(Jimple.v().newEqExpr(has, IntConstant.v(0)), exitTarget);
+        units.add(ifNoMore);
+
+        // nextObject = it.next(); record = (Record) nextObject
+        Value next = Jimple.v().newInterfaceInvokeExpr(it, nextRef, new ArrayList<Value>());
+        units.add(Jimple.v().newAssignStmt(nextObject, next));
+        units.add(Jimple.v().newAssignStmt(record,
+                Jimple.v().newCastExpr(nextObject, RefType.v("dbridge.runtime.Record"))));
+
+        // flag = record.getBoolean(1); if flag == 0 goto loop head
+        units.add(Jimple.v().newAssignStmt(p.flag,
+                Jimple.v().newVirtualInvokeExpr(record, getBoolRef, List.of(IntConstant.v(1)))));
+        IfStmt ifInactive = Jimple.v().newIfStmt(Jimple.v().newEqExpr(p.flag, IntConstant.v(0)), hasNext);
+        units.add(ifInactive);
+
+        // loopVar = record.getInt(2); resultVal = record.getInt(3)
+        units.add(Jimple.v().newAssignStmt(p.loopVar,
+                Jimple.v().newVirtualInvokeExpr(record, getIntRef, List.of(IntConstant.v(2)))));
+        units.add(Jimple.v().newAssignStmt(p.resultVal,
+                Jimple.v().newVirtualInvokeExpr(record, getIntRef, List.of(IntConstant.v(3)))));
+
+        // accumulate: agg = agg + resultVal
+        units.add(Jimple.v().newAssignStmt(p.agg, Jimple.v().newAddExpr(p.agg, p.resultVal)));
+
+        // order-sensitive op, re-pointed at record columns
+        units.add(rewriteOrderSensitive(p, record, getIntRef));
+
+        // goto loop head
+        units.add(Jimple.v().newGotoStmt(hasNext));
 
         return units;
+    }
+
+    private Unit rewriteOrderSensitive(Parts p, Local record, SootMethodRef getIntRef) {
+        InvokeStmt orderStmt = (InvokeStmt) p.orderSensitive;
+        InvokeExpr ie = orderStmt.getInvokeExpr();
+        List<Value> args = new ArrayList<>();
+        for (Value arg : ie.getArgs()) {
+            if (arg.equals(p.loopVar)) {
+                args.add(p.loopVar);
+            } else if (arg.equals(p.resultVal)) {
+                args.add(p.resultVal);
+            } else {
+                args.add(arg);
+            }
+        }
+        if (ie instanceof StaticInvokeExpr) {
+            return Jimple.v().newInvokeStmt(Jimple.v().newStaticInvokeExpr(ie.getMethodRef(), args));
+        }
+        return Jimple.v().newInvokeStmt(Jimple.v().newVirtualInvokeExpr(
+                (Local) ((InstanceInvokeExpr) ie).getBase(), ie.getMethodRef(), args));
     }
 
     private SootClass resolve(String className) {

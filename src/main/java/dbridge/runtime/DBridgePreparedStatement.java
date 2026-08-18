@@ -16,14 +16,11 @@ import net.sf.jsqlparser.statement.select.SelectItem;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-
-import org.h2.tools.SimpleResultSet;
 
 public class DBridgePreparedStatement {
 
@@ -120,7 +117,8 @@ public class DBridgePreparedStatement {
     }
 
     public ResultSet getResultSet() throws SQLException {
-        return (resultIndex >= 0 && resultIndex < results.size()) ? results.get(resultIndex) : null;
+        int i = resultIndex >= 0 ? resultIndex : 0;
+        return (i < results.size()) ? results.get(i) : null;
     }
 
     public void close() throws SQLException {
@@ -205,6 +203,7 @@ public class DBridgePreparedStatement {
         try (Statement st = conn.createStatement()) {
             st.execute("DROP TABLE IF EXISTS " + TEMP_TABLE);
             st.execute("CREATE TABLE " + TEMP_TABLE + " (" + col + " " + type + ")");
+            st.execute("CREATE INDEX " + TEMP_TABLE + "_idx ON " + TEMP_TABLE + "(" + col + ")");
         }
         try (PreparedStatement ins = conn.prepareStatement(
                 "INSERT INTO " + TEMP_TABLE + " (" + col + ") VALUES (?)")) {
@@ -216,29 +215,12 @@ public class DBridgePreparedStatement {
             ins.executeBatch();
         }
         String rewritten = buildRewrittenQuery(info, TEMP_TABLE);
-        try (Statement queryStmt = conn.createStatement();
-             ResultSet rs = queryStmt.executeQuery(rewritten)) {
-            ResultSetMetaData md = rs.getMetaData();
-            int colCount = md.getColumnCount();
-            // Emit one single-row result per binding, matching the batched
-            // getMoreResults()/getResultSet() contract expected by transformed code.
-            while (rs.next()) {
-                SimpleResultSet single = new SimpleResultSet();
-                for (int i = 1; i <= colCount; i++) {
-                    single.addColumn(md.getColumnName(i), md.getColumnType(i),
-                            md.getColumnDisplaySize(i), md.getScale(i));
-                }
-                Object[] row = new Object[colCount];
-                for (int i = 1; i <= colCount; i++) {
-                    row[i - 1] = rs.getObject(i);
-                }
-                single.addRow(row);
-                results.add(single);
-            }
-        }
-        try (Statement dropStmt = conn.createStatement()) {
-            dropStmt.execute("DROP TABLE IF EXISTS " + TEMP_TABLE);
-        }
+        Statement queryStmt = conn.createStatement();
+        ResultSet rs = queryStmt.executeQuery(rewritten);
+        heldStatements.add(queryStmt);
+        results.add(rs);
+        // pb is left in place (dropped at the start of the next executeBatch)
+        // because the returned ResultSet may be read lazily by the caller.
     }
 
     private Object firstBindingValue() {

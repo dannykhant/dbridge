@@ -22,12 +22,10 @@ public class Example2 {
             category = getParent(category);
         }
         pstmt.executeBatch();
-        while (pstmt.getMoreResults()) {
-            ResultSet rs = pstmt.getResultSet();
-            if (rs.next()) {
-                int partCount = rs.getInt(1);
-                total += partCount;
-            }
+        ResultSet rs = pstmt.getResultSet();
+        while (rs.next()) {
+            int partCount = rs.getInt(1);
+            total += partCount;
         }
         return total;
     }

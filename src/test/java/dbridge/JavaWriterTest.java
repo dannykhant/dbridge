@@ -31,7 +31,6 @@ public class JavaWriterTest {
         assertTrue(java.contains("while"), "should contain a while loop");
         assertTrue(java.contains("executeBatch"), "should contain executeBatch");
         assertTrue(java.contains("addBatch"), "should contain addBatch");
-        assertTrue(java.contains("getMoreResults"), "should contain getMoreResults");
         assertTrue(java.contains("getResultSet"), "should contain getResultSet");
         assertTrue(java.contains("return"), "should contain a return statement");
     }

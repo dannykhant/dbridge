@@ -247,7 +247,10 @@ public class JavaWriter {
                 AssignStmt s = (AssignStmt) u;
                 line(s.getLeftOp() + " = " + renderExpr(s.getRightOp()) + ";");
             } else if (u instanceof InvokeStmt) {
-                line(renderExpr(((InvokeStmt) u).getInvokeExpr()) + ";");
+                InvokeExpr invoke = ((InvokeStmt) u).getInvokeExpr();
+                if (!"<init>".equals(invoke.getMethod().getName())) {
+                    line(renderExpr(invoke) + ";");
+                }
             } else if (u instanceof ReturnStmt) {
                 line("return " + renderExpr(((ReturnStmt) u).getOp()) + ";");
             } else if (u instanceof IfStmt) {
@@ -281,7 +284,8 @@ public class JavaWriter {
             }
             if (v instanceof StaticInvokeExpr) {
                 StaticInvokeExpr ie = (StaticInvokeExpr) v;
-                return shortName(ie.getMethod().getDeclaringClass().getName()) + "." + ie.getMethod().getName()
+                return ie.getMethod().getDeclaringClass().getName().replace('$', '.') + "."
+                        + ie.getMethod().getName()
                         + args(ie.getArgs());
             }
             if (v instanceof InstanceInvokeExpr) {

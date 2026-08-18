@@ -2,9 +2,12 @@ package dbridge.analysis.jdbc.analysis;
 
 import dbridge.analysis.jdbc.expr.DIR;
 import dbridge.analysis.jdbc.expr.node.FoldNode;
+import dbridge.analysis.jdbc.expr.node.IfNode;
 import dbridge.analysis.jdbc.expr.node.Node;
+import dbridge.analysis.jdbc.expr.node.RetVarNode;
 import dbridge.analysis.jdbc.expr.node.UnAlgNode;
 import dbridge.analysis.jdbc.expr.node.VarNode;
+import dbridge.analysis.jdbc.util.VarResolver;
 import dbridge.analysis.region.exceptions.RegionAnalysisException;
 import dbridge.analysis.region.regions.ARegion;
 import dbridge.analysis.region.regions.LoopRegion;
@@ -40,12 +43,14 @@ public class DIRLoopRegionAnalyzer extends AbstractDIRRegionAnalyzer {
         VarNode loopVar = getLoopingCol(headDIR, bodyDIR);
         Map<VarNode, Set<VarNode>> varRsMap = fetchReadSets(bodyDIR);
         Set<VarNode> aggVars = findAggregatedVars(varRsMap);
+        // The induction variable is self-referential (e.g. category = category - 1)
+        // but is not an accumulator; exclude it from the cyclic-dependency test.
+        if (loopVar != null) {
+            aggVars.remove(loopVar);
+        }
 
         DIR loopDIR = new DIR();
         for (VarNode aggVar : aggVars) {
-            if (loopVar != null && aggVar.equals(loopVar)) {
-                continue;
-            }
             Set<VarNode> intersection = new HashSet<>(varRsMap.get(aggVar));
             intersection.retainAll(aggVars);
 
@@ -57,6 +62,21 @@ public class DIRLoopRegionAnalyzer extends AbstractDIRRegionAnalyzer {
                 loopDIR.insert(aggVar, UnAlgNode.v());
             }
         }
+
+        // The region graph can nest the loop exit (and hence the method's return
+        // statement) inside the loop head. Propagate the return variable so the
+        // enclosing analyzers can resolve the method's return value.
+        VarNode retVar = RetVarNode.getARetVar();
+        if (headDIR.contains(retVar)) {
+            Node retNode = headDIR.find(retVar);
+            while (retNode instanceof IfNode) {
+                retNode = ((IfNode) retNode).getThenExpr();
+            }
+            // Resolve the return value against the loop DIR (post-loop value).
+            retNode = retNode.accept(new VarResolver(loopDIR));
+            loopDIR.insert(retVar, retNode);
+        }
+
         return loopDIR;
     }
 

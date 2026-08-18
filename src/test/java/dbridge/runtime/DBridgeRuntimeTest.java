@@ -46,9 +46,8 @@ public class DBridgeRuntimeTest {
             pstmt.executeBatch();
 
             Map<Integer, Long> counts = new HashMap<>();
-            while (pstmt.getMoreResults()) {
-                ResultSet rs = pstmt.getResultSet();
-                assertTrue(rs.next());
+            ResultSet rs = pstmt.getResultSet();
+            while (rs.next()) {
                 counts.put(rs.getInt(2), rs.getLong(1));
             }
             assertEquals(2L, counts.get(1));

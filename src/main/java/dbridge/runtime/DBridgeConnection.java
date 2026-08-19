@@ -23,7 +23,10 @@ public class DBridgeConnection {
     }
 
     public DBridgePreparedStatement prepareStatement(String sql) throws SQLException {
-        PreparedStatement ps = connection.prepareStatement(sql);
+        // The generated set-oriented query references pb, which is created at executeBatch time.
+        PreparedStatement ps = sql != null && sql.startsWith("/* dbridge-prebuilt */ ")
+                ? connection.prepareStatement("SELECT ?")
+                : connection.prepareStatement(sql);
         return new DBridgePreparedStatement(ps, sql);
     }
 

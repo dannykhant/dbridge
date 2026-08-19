@@ -90,6 +90,7 @@ public class TransDriver {
         rules.add(new RuleT3B());
         rules.add(new RuleT4());
         rules.add(new RuleT5());
+        rules.add(new RuleT6());
         return rules;
     }
 }

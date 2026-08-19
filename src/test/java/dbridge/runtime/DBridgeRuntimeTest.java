@@ -59,6 +59,35 @@ public class DBridgeRuntimeTest {
     }
 
     @Test
+    public void prebuiltSetQueryExecutesWithoutRuntimeRewrite() throws Exception {
+        try (Connection setup = DriverManager.getConnection("jdbc:h2:mem:testdb_prebuilt")) {
+            createPartTable(setup);
+            try (Statement st = setup.createStatement()) {
+                st.execute("INSERT INTO part VALUES (10, 1), (20, 1), (30, 2)");
+            }
+
+            DBridgeConnection dbc = DBridgeConnection.getConnection("dbr:jdbc:h2:mem:testdb_prebuilt");
+            DBridgePreparedStatement pstmt = dbc.prepareStatement(
+                    "/* dbridge-prebuilt */ SELECT count(partkey), pb.category AS category, "
+                            + "pb.batch_ordinal FROM pb LEFT JOIN part ON pb.category = part.category "
+                            + "GROUP BY pb.batch_ordinal, pb.category");
+            pstmt.setInt(1, 1);
+            pstmt.addBatch();
+            pstmt.setInt(1, 2);
+            pstmt.addBatch();
+            pstmt.executeBatch();
+
+            ResultSet rs = pstmt.getResultSet();
+            assertTrue(rs.next());
+            assertEquals(2L, rs.getLong(1));
+            assertTrue(rs.next());
+            assertEquals(1L, rs.getLong(1));
+            assertTrue(!rs.next());
+            dbc.close();
+        }
+    }
+
+    @Test
     public void mergeResultsCopiesResultsIntoRecordsInOrder() throws Exception {
         try (Connection setup = DriverManager.getConnection("jdbc:h2:mem:testdb_merge")) {
             createPartTable(setup);

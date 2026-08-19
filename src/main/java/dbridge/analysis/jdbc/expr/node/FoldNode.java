@@ -17,13 +17,32 @@ public class FoldNode extends Node implements SQLTranslatable {
     private final VarNode aggVar;
     private final VarNode loopVar;
     public FoldNode(Node bodyExpr, VarNode aggVar, VarNode loopVar) {
-        super(OpType.Fold, bodyExpr);
+        super(OpType.Fold, new FuncExprNode(bodyExpr, aggVar), aggVar, loopVar);
         this.aggVar = aggVar;
         this.loopVar = loopVar;
     }
 
+    public FoldNode(FuncExprNode function, Node initValue, Node loopCollection) {
+        super(OpType.Fold, function, initValue, loopCollection);
+        this.aggVar = initValue instanceof VarNode ? (VarNode) initValue : null;
+        this.loopVar = loopCollection instanceof VarNode ? (VarNode) loopCollection : null;
+    }
+
     public Node getBodyExpr() {
-        return getChild(0);
+        Node function = getChild(0);
+        return function instanceof FuncExprNode ? ((FuncExprNode) function).getBody() : function;
+    }
+
+    public FuncExprNode getFunction() {
+        return (FuncExprNode) getChild(0);
+    }
+
+    public Node getInitValue() {
+        return getChild(1);
+    }
+
+    public Node getLoopCollection() {
+        return getChild(2);
     }
 
     public VarNode getAggVar() {

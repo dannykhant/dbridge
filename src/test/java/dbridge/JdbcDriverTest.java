@@ -40,6 +40,7 @@ public class JdbcDriverTest {
         String body = fsa.getBody().toString();
         assertTrue(body.contains("addBatch"));
         assertTrue(body.contains("executeBatch"));
-        assertTrue(body.contains("SELECT count(partkey) FROM part WHERE category = ?"));
+        assertTrue(body.contains("dbridge-prebuilt"));
+        assertTrue(body.contains("SELECT count(partkey), pb.category AS category, pb.batch_ordinal"));
     }
 }

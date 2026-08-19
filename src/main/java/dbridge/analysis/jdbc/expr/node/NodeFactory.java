@@ -14,7 +14,10 @@ public final class NodeFactory {
     public static Node constructFromOpType(OpType opType, Node... children) {
         switch (opType) {
             case Fold:
-                return new FoldNode(children.length > 0 ? children[0] : null, null, null);
+                if (children.length != 3 || !(children[0] instanceof FuncExprNode)) {
+                    throw new IllegalArgumentException("Fold requires FuncExpr, init value, and loop collection");
+                }
+                return new FoldNode((FuncExprNode) children[0], children[1], children[2]);
             case InvokeMethod:
                 return new InvokeMethodNode("", children);
             case ArithAdd:
@@ -57,10 +60,14 @@ public final class NodeFactory {
             case Dao:
             case MethodBooleanValue:
             case LazyFetch:
-            case PlaceholderVar:
             case MethodInsert:
+                return new GenericNode(opType, children);
             case FuncParams:
+                return new GenericNode(opType, children);
             case FuncExpr:
+                return new FuncExprNode(children.length == 0 ? null : children[0]);
+            case PlaceholderVar:
+                return new PlaceholderVarNode();
             case Ternary:
             case Seq:
                 return new GenericNode(opType, children);

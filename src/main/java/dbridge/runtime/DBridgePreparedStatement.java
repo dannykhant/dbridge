@@ -26,10 +26,13 @@ import javax.sql.rowset.RowSetProvider;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class DBridgePreparedStatement {
 
     private static final String TEMP_TABLE = "pb";
+    private static final String PREBUILT_MARKER = "/* dbridge-prebuilt */ ";
 
     private final PreparedStatement pstmt;
     private final String sql;
@@ -182,6 +185,9 @@ public class DBridgePreparedStatement {
     }
 
     private boolean isScalarAggregate() {
+        if (sql.startsWith(PREBUILT_MARKER)) {
+            return true;
+        }
         if (!scalarInfoComputed) {
             scalarInfo = parseScalarAggregate();
             scalarInfoComputed = true;
@@ -303,6 +309,10 @@ public class DBridgePreparedStatement {
     }
 
     private void executeScalarAggregate(ScalarAggregateInfo info) throws SQLException {
+        if (sql.startsWith(PREBUILT_MARKER)) {
+            executePrebuiltQuery();
+            return;
+        }
         if (batches.isEmpty()) {
             results.add(emptyResultSet());
             return;
@@ -333,6 +343,40 @@ public class DBridgePreparedStatement {
         results.add(rs);
         // pb is left in place (dropped at the start of the next executeBatch)
         // because the returned ResultSet may be read lazily by the caller.
+    }
+
+    private void executePrebuiltQuery() throws SQLException {
+        if (batches.isEmpty()) {
+            results.add(emptyResultSet());
+            return;
+        }
+        Matcher matcher = Pattern.compile("\\bpb\\.([A-Za-z_][A-Za-z0-9_]*)\\s+AS\\s+\\1\\b",
+                Pattern.CASE_INSENSITIVE).matcher(sql);
+        if (!matcher.find()) {
+            throw new SQLException("Prebuilt DBridge query has no binding column: " + sql);
+        }
+        String column = matcher.group(1);
+        Connection conn = pstmt.getConnection();
+        String type = sqlTypeFor(firstBindingValue());
+        try (Statement st = conn.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS " + TEMP_TABLE);
+            st.execute("CREATE TABLE " + TEMP_TABLE + " (batch_ordinal BIGINT, " + column + " " + type + ")");
+            st.execute("CREATE INDEX " + TEMP_TABLE + "_idx ON " + TEMP_TABLE + "(" + column + ")");
+        }
+        try (PreparedStatement ins = conn.prepareStatement(
+                "INSERT INTO " + TEMP_TABLE + " (batch_ordinal, " + column + ") VALUES (?, ?)")) {
+            for (int ordinal = 0; ordinal < batches.size(); ordinal++) {
+                Object[] batch = batches.get(ordinal);
+                ins.setLong(1, ordinal);
+                ins.setObject(2, batch.length > 1 ? batch[1] : null);
+                ins.addBatch();
+            }
+            ins.executeBatch();
+        }
+        Statement queryStmt = conn.createStatement();
+        ResultSet rs = queryStmt.executeQuery(sql.substring(PREBUILT_MARKER.length()));
+        heldStatements.add(queryStmt);
+        results.add(rs);
     }
 
     private ResultSet emptyResultSet() throws SQLException {
@@ -442,6 +486,7 @@ public class DBridgePreparedStatement {
                         continue;
                     }
                 }
+
                 extras.add(c.toString());
             }
             if (col == null) {

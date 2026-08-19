@@ -25,6 +25,7 @@ public abstract class Node implements Visitable {
     private final List<Node> children = new ArrayList<>();
     private ARegion region;
     private final List<Stmt> stmts = new ArrayList<>();
+    private final List<LoopRegion> loopsSwallowed = new ArrayList<>();
 
     protected Node(OpType opType) {
         this.opType = opType;
@@ -115,7 +116,13 @@ public abstract class Node implements Visitable {
      * Only {@link FoldNode} overrides this.
      */
     public List<LoopRegion> getLoopsSwallowed() {
-        return Collections.emptyList();
+        return loopsSwallowed;
+    }
+
+    public void addLoopSwallowed(LoopRegion loop) {
+        if (loop != null && !loopsSwallowed.contains(loop)) {
+            loopsSwallowed.add(loop);
+        }
     }
 
     @Override

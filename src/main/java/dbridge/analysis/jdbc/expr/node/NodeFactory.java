@@ -18,6 +18,8 @@ public final class NodeFactory {
             case InvokeMethod:
                 return new InvokeMethodNode("", children);
             case ArithAdd:
+            case ArithSub:
+            case ArithMod:
             case Eq:
             case NotEq:
             case Gt:
@@ -27,7 +29,7 @@ public final class NodeFactory {
                 return new BinaryOpNode(opType, children.length > 0 ? children[0] : null,
                         children.length > 1 ? children[1] : null);
             case Var:
-                return new VarNode((soot.Local) null);
+                throw new IllegalArgumentException("Var nodes require a Local");
             case RetVar:
                 return RetVarNode.getARetVar();
             case Param:
@@ -46,26 +48,40 @@ public final class NodeFactory {
             case Bottom:
                 return new BinaryOpNode(OpType.Bottom, null, null);
             case Zero:
+                return new ZeroNode();
             case One:
+                return new OneNode();
             case MethodIterator:
             case MethodNext:
             case SelfRef:
-            case FieldRef:
             case Dao:
             case MethodBooleanValue:
-            case CartesianProd:
             case LazyFetch:
             case PlaceholderVar:
             case MethodInsert:
             case FuncParams:
             case FuncExpr:
             case Ternary:
-            case Select:
             case Seq:
+                return new GenericNode(opType, children);
+            case Select:
+                return new SelectNode(children.length > 0 ? children[0] : null,
+                        children.length > 1 ? children[1] : null);
             case Project:
+                return new ProjectNode(children.length > 0 ? children[0] : null,
+                        children.length > 1 ? children[1] : null);
             case ClassRef:
+                return new ClassRefNode((String) null);
+            case FieldRef:
+                return new FieldRefNode(null, null, null);
+            case CartesianProd:
+                return new CartesianProdNode(children);
             case ConstTable:
+                return new ConstTableNode();
             case CountStar:
+                if (opType == OpType.CountStar) {
+                    return new CountStarNode();
+                }
                 return new GenericNode(opType, children);
             default:
                 throw new IllegalArgumentException("Unsupported op type: " + opType);

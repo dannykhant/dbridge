@@ -3,6 +3,7 @@ package dbridge.analysis.jdbc.expr;
 import dbridge.analysis.jdbc.expr.node.Node;
 import dbridge.analysis.jdbc.expr.node.RetVarNode;
 import dbridge.analysis.jdbc.expr.node.VarNode;
+import dbridge.analysis.jdbc.analysis.AnalyzedLoopCandidate;
 import dbridge.analysis.region.regions.ARegion;
 import soot.Type;
 import soot.Unit;
@@ -25,6 +26,7 @@ public class DIR {
 
     private final Map<VarNode, Node> veMap;
     private ARegion region;
+    private final List<AnalyzedLoopCandidate> candidates = new ArrayList<>();
 
     public DIR() {
         veMap = new HashMap<>();
@@ -36,6 +38,7 @@ public class DIR {
         for (Map.Entry<VarNode, Node> entry : other.getVeMap().entrySet()) {
             this.veMap.put(entry.getKey(), entry.getValue());
         }
+        this.candidates.addAll(other.candidates);
     }
 
     public void insert(VarNode target, Node expr) {
@@ -57,6 +60,14 @@ public class DIR {
 
     public Map<VarNode, Node> getVeMap() {
         return veMap;
+    }
+
+    public void addCandidate(AnalyzedLoopCandidate candidate) {
+        if (candidate != null && !candidates.contains(candidate)) candidates.add(candidate);
+    }
+
+    public List<AnalyzedLoopCandidate> getCandidates() {
+        return Collections.unmodifiableList(candidates);
     }
 
     public boolean contains(VarNode key) {

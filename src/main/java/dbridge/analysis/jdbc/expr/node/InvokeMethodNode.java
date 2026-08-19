@@ -9,14 +9,24 @@ import dbridge.analysis.jdbc.expr.OpType;
 public class InvokeMethodNode extends Node {
 
     private final String methodName;
+    private final String methodSignature;
 
     public InvokeMethodNode(String methodName, Node... children) {
+        this(methodName, null, children);
+    }
+
+    public InvokeMethodNode(String methodName, String methodSignature, Node... children) {
         super(OpType.InvokeMethod, children);
         this.methodName = methodName;
+        this.methodSignature = methodSignature;
     }
 
     public String getMethodName() {
         return methodName;
+    }
+
+    public String getMethodSignature() {
+        return methodSignature;
     }
 
     public Node getReceiver() {

@@ -21,6 +21,7 @@ public class OutputTree {
     private final Kind kind;
     private final int id;
     private final OpType opType;
+    private final LeafConstructor leafConstructor;
     private final List<OutputTree> children = new ArrayList<>();
 
     /** Reference a node bound in the input pattern by its id. */
@@ -28,17 +29,32 @@ public class OutputTree {
         this.kind = Kind.FROM_INPUT;
         this.id = id;
         this.opType = null;
+        this.leafConstructor = null;
     }
 
-    private OutputTree(Kind kind, int id) {
+    private OutputTree(Kind kind, int id, LeafConstructor leafConstructor) {
         this.kind = kind;
         this.id = id;
         this.opType = null;
+        this.leafConstructor = leafConstructor;
     }
 
     /** Reuse a bound input node directly. */
     public static OutputTree fromScratch(int id) {
-        return new OutputTree(Kind.FROM_SCRATCH, id);
+        return new OutputTree(Kind.FROM_SCRATCH, id, bound -> bound);
+    }
+
+    /** Construct a fresh leaf using the node bound by the input id. */
+    public OutputTree(int id, LeafConstructor leafConstructor) {
+        this.kind = Kind.FROM_SCRATCH;
+        this.id = id;
+        this.opType = null;
+        this.leafConstructor = leafConstructor;
+    }
+
+    /** Construct a fresh leaf without an input binding. */
+    public OutputTree(LeafConstructor leafConstructor) {
+        this(-1, leafConstructor);
     }
 
     /** Build a fresh subtree with the given op type and children. */
@@ -46,6 +62,7 @@ public class OutputTree {
         this.kind = Kind.TREE;
         this.id = -1;
         this.opType = opType;
+        this.leafConstructor = null;
         this.children.addAll(Arrays.asList(children));
     }
 
@@ -75,7 +92,7 @@ public class OutputTree {
 
     /** For FROM_SCRATCH: return the bound node itself. */
     public Node getNode(Node bound) {
-        return bound;
+        return leafConstructor == null ? bound : leafConstructor.construct(bound);
     }
 
     @Override

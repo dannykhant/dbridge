@@ -6,7 +6,7 @@ package dbridge.analysis.jdbc.expr;
 public enum OpType {
     Fold,
     InvokeMethod,
-    ArithAdd, Eq, NotEq, Gt, Lt, And, Or,
+    ArithAdd, ArithSub, ArithMod, Eq, NotEq, Gt, Lt, And, Or,
     Var, RetVar, Param, Value, StringConst,
     If,
     Any, Bottom, UnAlg,

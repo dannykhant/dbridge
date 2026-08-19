@@ -36,6 +36,9 @@ final class Utils {
             }
             precedingDIR.insert(key, entry.getValue());
         }
+        for (AnalyzedLoopCandidate candidate : followingDIR.getCandidates()) {
+            precedingDIR.addCandidate(candidate);
+        }
         return precedingDIR;
     }
 

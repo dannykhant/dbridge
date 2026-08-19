@@ -79,6 +79,10 @@ public class Rule implements NodeVisitor {
 
         if (isApplicable) {
             Node outExpr = getOutputExpr(this.outPattern);
+            outExpr.setRegion(inExpr.getRegion());
+            for (dbridge.analysis.region.regions.LoopRegion loop : inExpr.getLoopsSwallowed()) {
+                outExpr.addLoopSwallowed(loop);
+            }
             doCleanup();
             for (Stmt stmt : inExpr.getStmts()) {
                 outExpr.addStmts(stmt);

@@ -5,6 +5,7 @@ import dbridge.analysis.jdbc.expr.node.BinaryOpNode;
 import dbridge.analysis.jdbc.expr.node.InvokeMethodNode;
 import dbridge.analysis.jdbc.expr.node.Node;
 import dbridge.analysis.jdbc.expr.node.RetVarNode;
+import dbridge.analysis.jdbc.expr.node.StringConstNode;
 import dbridge.analysis.jdbc.expr.node.ValueNode;
 import dbridge.analysis.jdbc.expr.node.VarNode;
 import soot.Local;
@@ -21,6 +22,7 @@ import soot.jimple.InvokeExpr;
 import soot.jimple.InvokeStmt;
 import soot.jimple.ReturnStmt;
 import soot.jimple.Stmt;
+import soot.jimple.StringConstant;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -132,6 +134,9 @@ public final class StmtDIRConstructionHandler {
         if (v instanceof CastExpr) {
             return buildValueNode(((CastExpr) v).getOp());
         }
+        if (v instanceof StringConstant) {
+            return new StringConstNode(((StringConstant) v).value);
+        }
         return new ValueNode(v);
     }
 
@@ -144,13 +149,17 @@ public final class StmtDIRConstructionHandler {
         for (Value arg : invoke.getArgs()) {
             children.add(buildValueNode(arg));
         }
-        return new InvokeMethodNode(methodName, children.toArray(new Node[0]));
+        return new InvokeMethodNode(methodName, invoke.getMethod().getSignature(), children.toArray(new Node[0]));
     }
 
     private static OpType opTypeFor(BinopExpr binop) {
-        switch (binop.getSymbol()) {
+        switch (binop.getSymbol().trim()) {
             case "+":
                 return OpType.ArithAdd;
+            case "-":
+                return OpType.ArithSub;
+            case "%":
+                return OpType.ArithMod;
             case "==":
                 return OpType.Eq;
             case "!=":
@@ -164,7 +173,7 @@ public final class StmtDIRConstructionHandler {
             case "||":
                 return OpType.Or;
             default:
-                return OpType.ArithAdd;
+                throw new IllegalArgumentException("Unsupported Jimple operator: " + binop.getSymbol());
         }
     }
 }

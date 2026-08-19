@@ -3,6 +3,7 @@ package dbridge.runtime;
 import net.sf.jsqlparser.expression.Alias;
 import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.expression.JdbcParameter;
+import net.sf.jsqlparser.expression.ExpressionVisitorAdapter;
 import net.sf.jsqlparser.expression.operators.conditional.AndExpression;
 import net.sf.jsqlparser.expression.operators.relational.EqualsTo;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
@@ -16,8 +17,12 @@ import net.sf.jsqlparser.statement.select.SelectItem;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import javax.sql.rowset.RowSetMetaDataImpl;
+import javax.sql.rowset.CachedRowSet;
+import javax.sql.rowset.RowSetProvider;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -68,6 +73,11 @@ public class DBridgePreparedStatement {
 
     public void bind(int parameterIndex, Object x) {
         setBinding(parameterIndex, x);
+        try {
+            pstmt.setObject(parameterIndex, x);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Unable to bind parameter " + parameterIndex, e);
+        }
     }
 
     private void setBinding(int parameterIndex, Object x) {
@@ -91,6 +101,8 @@ public class DBridgePreparedStatement {
         try {
             if (scalar) {
                 executeScalarAggregate(scalarInfo);
+            } else if (isQuery()) {
+                executeQueryBatches();
             } else {
                 pstmt.executeBatch();
                 try {
@@ -108,6 +120,65 @@ public class DBridgePreparedStatement {
                 pstmt.clearBatch();
             }
         }
+    }
+
+    private boolean isQuery() {
+        String normalized = sql.trim().toLowerCase();
+        while (normalized.startsWith("(")) normalized = normalized.substring(1).trim();
+        return normalized.startsWith("select ") || normalized.startsWith("with ")
+                || normalized.startsWith("values ");
+    }
+
+    private void executeQueryBatches() throws SQLException {
+        if (batches.isEmpty()) {
+            results.add(emptyResultSet());
+            return;
+        }
+        CachedRowSet materialized = null;
+        for (int ordinal = 0; ordinal < batches.size(); ordinal++) {
+            Object[] batch = batches.get(ordinal);
+            try (PreparedStatement query = pstmt.getConnection().prepareStatement(sql)) {
+                for (int i = 1; i < batch.length; i++) {
+                    query.setObject(i, batch[i]);
+                }
+                try (ResultSet rs = query.executeQuery()) {
+                    if (materialized == null) {
+                        materialized = RowSetProvider.newFactory().createCachedRowSet();
+                        materialized.setMetaData(copyMetadata(rs.getMetaData(), true));
+                    }
+                    int columns = rs.getMetaData().getColumnCount();
+                    while (rs.next()) {
+                        materialized.moveToInsertRow();
+                        for (int column = 1; column <= columns; column++) {
+                            materialized.updateObject(column, rs.getObject(column));
+                        }
+                        materialized.updateLong(columns + 1, ordinal);
+                        materialized.insertRow();
+                        materialized.moveToCurrentRow();
+                        materialized.afterLast();
+                    }
+                }
+            }
+        }
+        materialized.beforeFirst();
+        results.add(materialized);
+    }
+
+    private RowSetMetaDataImpl copyMetadata(ResultSetMetaData source, boolean addOrdinal) throws SQLException {
+        RowSetMetaDataImpl metadata = new RowSetMetaDataImpl();
+        int columns = source.getColumnCount();
+        metadata.setColumnCount(columns + (addOrdinal ? 1 : 0));
+        for (int i = 1; i <= columns; i++) {
+            metadata.setColumnName(i, source.getColumnName(i));
+            metadata.setColumnType(i, source.getColumnType(i));
+            metadata.setNullable(i, source.isNullable(i));
+        }
+        if (addOrdinal) {
+            metadata.setColumnName(columns + 1, "batch_ordinal");
+            metadata.setColumnType(columns + 1, java.sql.Types.BIGINT);
+            metadata.setNullable(columns + 1, ResultSetMetaData.columnNoNulls);
+        }
+        return metadata;
     }
 
     private boolean isScalarAggregate() {
@@ -186,15 +257,18 @@ public class DBridgePreparedStatement {
                 return null;
             }
             PlainSelect ps = ((Select) stmt).getPlainSelect();
-            if (ps == null) {
+        if (ps == null || (ps.getJoins() != null && !ps.getJoins().isEmpty())) {
                 return null;
             }
             List<SelectItem<?>> items = ps.getSelectItems();
             if (items == null || items.size() != 1) {
                 return null;
             }
-            SelectItem<?> item = items.get(0);
-            Expression agg = item.getExpression();
+        SelectItem<?> item = items.get(0);
+        Expression agg = item.getExpression();
+        if (countJdbcParameters(ps.getWhere()) != 1) {
+            return null;
+        }
             FromItem fromItem = ps.getFromItem();
             if (!(fromItem instanceof Table)) {
                 return null;
@@ -219,8 +293,18 @@ public class DBridgePreparedStatement {
         }
     }
 
+    private int countJdbcParameters(Expression expression) {
+        if (expression == null) return 0;
+        final int[] count = {0};
+        expression.accept(new ExpressionVisitorAdapter() {
+            @Override public void visit(JdbcParameter parameter) { count[0]++; }
+        });
+        return count[0];
+    }
+
     private void executeScalarAggregate(ScalarAggregateInfo info) throws SQLException {
         if (batches.isEmpty()) {
+            results.add(emptyResultSet());
             return;
         }
         Connection conn = pstmt.getConnection();
@@ -249,6 +333,16 @@ public class DBridgePreparedStatement {
         results.add(rs);
         // pb is left in place (dropped at the start of the next executeBatch)
         // because the returned ResultSet may be read lazily by the caller.
+    }
+
+    private ResultSet emptyResultSet() throws SQLException {
+        CachedRowSet rowSet = RowSetProvider.newFactory().createCachedRowSet();
+        RowSetMetaDataImpl metadata = new RowSetMetaDataImpl();
+        metadata.setColumnCount(1);
+        metadata.setColumnName(1, "result");
+        metadata.setColumnType(1, java.sql.Types.INTEGER);
+        rowSet.setMetaData(metadata);
+        return rowSet;
     }
 
     private Object firstBindingValue() {

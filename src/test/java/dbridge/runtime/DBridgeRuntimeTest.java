@@ -125,4 +125,50 @@ public class DBridgeRuntimeTest {
             dbc.close();
         }
     }
+
+    @Test
+    public void emptyScalarBatchReturnsAnEmptyResultSet() throws Exception {
+        try (Connection setup = DriverManager.getConnection("jdbc:h2:mem:testdb_empty")) {
+            createPartTable(setup);
+            DBridgeConnection dbc = DBridgeConnection.getConnection("dbr:jdbc:h2:mem:testdb_empty");
+            DBridgePreparedStatement pstmt = dbc.prepareStatement(
+                    "SELECT count(partkey) FROM part WHERE category = ?");
+            pstmt.executeBatch();
+            assertTrue(pstmt.getResultSet() != null);
+            assertTrue(!pstmt.getResultSet().next());
+            dbc.close();
+        }
+    }
+
+    @Test
+    public void generalQueryFallbackPreservesBatchOrdinals() throws Exception {
+        try (Connection setup = DriverManager.getConnection("jdbc:h2:mem:testdb_general")) {
+            try (Statement st = setup.createStatement()) {
+                st.execute("CREATE TABLE customer(id INT, region VARCHAR(20))");
+                st.execute("CREATE TABLE orders(id INT, customer_id INT, status VARCHAR(20))");
+                st.execute("INSERT INTO customer VALUES (1, 'north'), (2, 'south')");
+                st.execute("INSERT INTO orders VALUES (10, 1, 'open'), (13, 2, 'open')");
+            }
+            DBridgeConnection dbc = DBridgeConnection.getConnection("dbr:jdbc:h2:mem:testdb_general");
+            DBridgePreparedStatement pstmt = dbc.prepareStatement(
+                    "SELECT o.id, c.region FROM customer c JOIN orders o "
+                            + "ON c.id = o.customer_id WHERE c.region = ? AND o.status = ?");
+            pstmt.setString(1, "north");
+            pstmt.setString(2, "open");
+            pstmt.addBatch();
+            pstmt.setString(1, "south");
+            pstmt.setString(2, "open");
+            pstmt.addBatch();
+            pstmt.executeBatch();
+            ResultSet rs = pstmt.getResultSet();
+            assertTrue(rs.next());
+            assertEquals(10, rs.getInt(1));
+            assertEquals(0, rs.getLong(3));
+            assertTrue(rs.next());
+            assertEquals(13, rs.getInt(1));
+            assertEquals(1, rs.getLong(3));
+            assertTrue(!rs.next());
+            dbc.close();
+        }
+    }
 }

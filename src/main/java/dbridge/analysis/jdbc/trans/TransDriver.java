@@ -15,15 +15,33 @@ import java.util.List;
  */
 public class TransDriver {
 
-    private static final int NUM_TRANS_ITERS = 2;
+    private static final int MAX_TRANS_ITERS = 32;
 
     private static final List<Rule> simpliRules = getSimplificationRules();
     private static final List<Rule> foldRules = getFoldTransRules();
 
     public static Node applyAllTransRules(Node expr) {
-        expr = applySimpliRules(expr);
-        expr = applyFoldRules(expr);
-        expr = applySimpliRules(expr);
+        if (expr == null) {
+            return null;
+        }
+        dbridge.analysis.region.regions.ARegion region = expr.getRegion();
+        List<dbridge.analysis.region.regions.LoopRegion> loops =
+                new ArrayList<>(expr.getLoopsSwallowed());
+        for (int i = 0; i < MAX_TRANS_ITERS; i++) {
+            String before = expr.toString();
+            expr = applySimpliRules(expr);
+            expr = applyFoldRules(expr);
+            expr = applySimpliRules(expr);
+            if (before.equals(expr.toString())) {
+                break;
+            }
+        }
+        if (region != null) {
+            expr.setRegion(region);
+        }
+        for (dbridge.analysis.region.regions.LoopRegion loop : loops) {
+            expr.addLoopSwallowed(loop);
+        }
         return expr;
     }
 
@@ -37,10 +55,8 @@ public class TransDriver {
 
     private static Node applyTransRules(Node inNode, List<Rule> rules) {
         Node transNode = inNode;
-        for (int i = 0; i < NUM_TRANS_ITERS; i++) {
-            for (Rule rule : rules) {
-                transNode = transNode.accept(rule);
-            }
+        for (Rule rule : rules) {
+            transNode = transNode.accept(rule);
         }
         return transNode;
     }

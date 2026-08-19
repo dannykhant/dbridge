@@ -2,7 +2,6 @@ package dbridge;
 
 import dbridge.analysis.jdbc.FuncStackAnalyzer;
 import dbridge.analysis.jdbc.JdbcDriver;
-import dbridge.rewrite.BodyRewriter;
 import dbridge.rewrite.SootDava;
 
 import java.nio.charset.StandardCharsets;
@@ -39,8 +38,10 @@ public class Main {
 
         System.out.println("Swallowed loops: " + fsa.getLoopsSwallowed().size());
 
-        BodyRewriter rewriter = new BodyRewriter(fsa.getBody(), fsa.getLoopsSwallowed());
-        rewriter.rewriteBody();
+        if (!driver.rewrite(fsa)) {
+            System.err.println("Rewrite failed: expression is not SQL translatable.");
+            System.exit(3);
+        }
 
         String java = args.length == 5
                 ? SootDava.emit(new String(Files.readAllBytes(Paths.get(args[4])), StandardCharsets.UTF_8), fsa.getBody())

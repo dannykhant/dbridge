@@ -23,7 +23,8 @@ public class BodyRewriterTest {
         FuncStackAnalyzer fsa = driver.analyze("dbridge.test.Example1", "int getTotalPartCount(int)");
         assertTrue(fsa.isSuccess());
 
-        BodyRewriter rewriter = new BodyRewriter(fsa.getBody(), fsa.getLoopsSwallowed());
+        BodyRewriter rewriter = new BodyRewriter("select generated", fsa.getRetRegion(),
+                fsa.getBody(), fsa.getRetType(), fsa.getLoopsSwallowed());
         rewriter.rewriteBody();
 
         String result = fsa.getBody().toString();
@@ -31,5 +32,6 @@ public class BodyRewriterTest {
         assertTrue(result.contains("executeBatch"), "should contain executeBatch");
         assertTrue(result.contains("getResultSet"), "should contain getResultSet");
         assertTrue(result.contains("DBridgeConnection"), "should route connection through runtime");
+        assertTrue(result.contains("select generated"), "should replace the prepared SQL");
     }
 }

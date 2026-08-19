@@ -1,6 +1,8 @@
 package dbridge.rewrite;
 
 import dbridge.analysis.region.regions.LoopRegion;
+import dbridge.analysis.region.regions.ARegion;
+import dbridge.analysis.jdbc.analysis.AnalyzedLoopCandidate;
 import soot.Body;
 import soot.BooleanType;
 import soot.IntType;
@@ -25,9 +27,6 @@ import soot.jimple.StaticInvokeExpr;
 import soot.jimple.StringConstant;
 import soot.jimple.Stmt;
 import soot.jimple.SubExpr;
-import soot.jimple.toolkits.annotation.logic.Loop;
-import soot.jimple.toolkits.annotation.logic.LoopFinder;
-import soot.toolkits.graph.BriefUnitGraph;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -49,34 +48,68 @@ public class BodyRewriter {
 
     private final Body body;
     private final List<LoopRegion> loopsSwallowed;
+    private final String query;
+    private final ARegion region;
+    private final soot.Type varType;
+    private final List<AnalyzedLoopCandidate> analyzedCandidates;
 
     public BodyRewriter(Body body, List<LoopRegion> loopsSwallowed) {
+        this(null, null, body, null, loopsSwallowed, null);
+    }
+
+    public BodyRewriter(String query, ARegion region, Body body, soot.Type varType,
+                        List<LoopRegion> loopsSwallowed) {
+        this(query, region, body, varType, loopsSwallowed, null);
+    }
+
+    public BodyRewriter(String query, ARegion region, Body body, soot.Type varType,
+                        List<LoopRegion> loopsSwallowed,
+                        List<AnalyzedLoopCandidate> analyzedCandidates) {
+        this.query = query;
+        this.region = region;
         this.body = body;
         this.loopsSwallowed = loopsSwallowed;
+        this.varType = varType;
+        this.analyzedCandidates = analyzedCandidates == null
+                ? candidatesFromRegions(loopsSwallowed) : analyzedCandidates;
     }
 
-    public void rewriteBody() {
-        BriefUnitGraph ug = new BriefUnitGraph(body);
-        LoopFinder loopFinder = new LoopFinder();
-        List<Loop> candidates = new ArrayList<>();
-        for (Loop loop : loopFinder.getLoops(ug)) {
-            if (isAnalyzedCandidate(loop)) {
-                candidates.add(loop);
+    private static List<AnalyzedLoopCandidate> candidatesFromRegions(List<LoopRegion> regions) {
+        List<AnalyzedLoopCandidate> result = new ArrayList<>();
+        if (regions == null) return result;
+        for (LoopRegion region : regions) {
+            // Loop exits: conditional branches whose target leaves the loop
+            // body (the head may also contain post-loop statements such as a
+            // return statement).
+            List<Stmt> exits = new ArrayList<>();
+            Set<Unit> bodyUnits = new HashSet<>(region.getSubRegions().get(1).getUnits());
+            for (Unit unit : region.getUnits()) {
+                if (unit instanceof IfStmt && !bodyUnits.contains(((IfStmt) unit).getTarget())) {
+                    exits.add((Stmt) unit);
+                }
             }
+            Unit exitTarget = exits.isEmpty() ? null : ((IfStmt) exits.get(0)).getTarget();
+            // The guarded statements (head + body) drive the rewrite, but the
+            // exit target and any other post-loop statements are not part of
+            // the loop.
+            List<Stmt> statements = new ArrayList<>();
+            for (Unit unit : region.getUnits()) {
+                if (unit instanceof Stmt && unit != exitTarget) {
+                    statements.add((Stmt) unit);
+                }
+            }
+            result.add(new AnalyzedLoopCandidate(region.getSubRegions().get(0).firstStmt(), statements, exits));
         }
-        if (candidates.isEmpty()) {
-            return;
-        }
-        rewriteJdbcSetup();
-        for (Loop loop : candidates) {
-            transformLoop(loop);
-        }
+        return result;
     }
 
-    private boolean isAnalyzedCandidate(Loop loop) {
-        List<Unit> loopUnits = new ArrayList<>(loop.getLoopStatements());
-        for (LoopRegion region : loopsSwallowed) {
-            if (region.getUnits().containsAll(loopUnits)) {
+    public boolean rewriteBody() {
+        for (AnalyzedLoopCandidate candidate : analyzedCandidates) {
+            Parts parts = classify(candidate);
+            if (parts != null && validate(candidate, parts)) {
+                reorderStatements(parts);
+                rewriteJdbcSetup();
+                transformLoop(candidate, parts);
                 return true;
             }
         }
@@ -130,7 +163,11 @@ public class BodyRewriter {
         SootMethodRef ref = Scene.v().makeMethodRef(
                 resolve("dbridge.runtime.DBridgeConnection"), "prepareStatement",
                 Arrays.asList(RefType.v("java.lang.String")), RefType.v("dbridge.runtime.DBridgePreparedStatement"), false);
-        assign.setRightOp(Jimple.v().newVirtualInvokeExpr((Local) invoke.getBase(), ref, invoke.getArgs()));
+        List<Value> args = invoke.getArgs();
+        if (query != null && args.size() == 1) {
+            args = Arrays.<Value>asList(StringConstant.v(query));
+        }
+        assign.setRightOp(Jimple.v().newVirtualInvokeExpr((Local) invoke.getBase(), ref, args));
     }
 
     // ------------------------------------------------------------------
@@ -149,24 +186,25 @@ public class BodyRewriter {
         IfStmt innerIf;
         Unit getIntStmt;
         Unit accumulate;
-        Unit orderSensitive;
+        List<InvokeStmt> orderSensitive = new ArrayList<>();
         Unit loopVarUpdate;
         Local pstmt;
         Local rs;
         Local nextResult;
         Local resultVal;
+        String resultGetter;
         Local agg;
         Local loopVar;
         Local flag;
         boolean conditional;
     }
 
-    private Parts classify(Loop loop) {
-        List<Stmt> stmts = new ArrayList<>(loop.getLoopStatements());
+    private Parts classify(AnalyzedLoopCandidate candidate) {
+        List<Stmt> stmts = new ArrayList<>(candidate.getStatements());
         stmts.sort((a, b) -> indexOf(a) - indexOf(b));
 
         Parts p = new Parts();
-        for (Stmt s : loop.getLoopExits()) {
+        for (Stmt s : candidate.getExits()) {
             if (s instanceof IfStmt) {
                 p.headIf = (IfStmt) s;
                 break;
@@ -177,7 +215,7 @@ public class BodyRewriter {
         }
         p.exitTarget = p.headIf.getTarget();
 
-        boolean pastHead = false;
+        boolean pastHead = true;
         for (Stmt s : stmts) {
             if (s == p.headIf) {
                 pastHead = true;
@@ -193,7 +231,7 @@ public class BodyRewriter {
                 IfStmt ifs = (IfStmt) s;
                 if (p.condAssign != null && usesCondition(ifs, (Local) ((AssignStmt) p.condAssign).getLeftOp())) {
                     p.outerIf = ifs;
-                } else {
+                } else if (p.nextStmt != null && usesResult(ifs, (Local) ((AssignStmt) p.nextStmt).getLeftOp())) {
                     p.innerIf = ifs;
                 }
             } else if (s instanceof InvokeStmt) {
@@ -201,7 +239,7 @@ public class BodyRewriter {
                 if (BIND_METHODS.contains(ie.getMethod().getName())) {
                     p.binding = s;
                 } else {
-                    p.orderSensitive = s;
+                    p.orderSensitive.add((InvokeStmt) s);
                 }
             } else if (s instanceof AssignStmt) {
                 AssignStmt as = (AssignStmt) s;
@@ -214,6 +252,7 @@ public class BodyRewriter {
                         p.nextStmt = s;
                     } else if (m.equals("getInt") || m.equals("getLong") || m.equals("getString")) {
                         p.getIntStmt = s;
+                        p.resultGetter = m;
                     }
                 } else if (r instanceof StaticInvokeExpr) {
                     if (((AssignStmt) s).getLeftOp().getType() instanceof BooleanType) {
@@ -225,6 +264,16 @@ public class BodyRewriter {
                     p.accumulate = s;
                 } else if (r instanceof SubExpr) {
                     p.loopVarUpdate = s;
+                }
+            }
+        }
+
+        if (p.innerIf == null && p.nextStmt != null) {
+            Local nextLocal = (Local) ((AssignStmt) p.nextStmt).getLeftOp();
+            for (Stmt s : stmts) {
+                if (s instanceof IfStmt && usesResult((IfStmt) s, nextLocal)) {
+                    p.innerIf = (IfStmt) s;
+                    break;
                 }
             }
         }
@@ -242,8 +291,74 @@ public class BodyRewriter {
         p.loopVar = (Local) ((AssignStmt) p.loopVarUpdate).getLeftOp();
         p.flag = p.condAssign != null ? (Local) ((AssignStmt) p.condAssign).getLeftOp() : null;
 
-        p.conditional = p.condAssign != null || p.orderSensitive != null;
+        p.conditional = p.condAssign != null || !p.orderSensitive.isEmpty();
+        if (!p.orderSensitive.isEmpty() && p.flag == null) {
+            return null;
+        }
         return p;
+    }
+
+    private boolean validate(AnalyzedLoopCandidate candidate, Parts p) {
+        Set<Unit> recognized = new HashSet<>(Arrays.asList(
+                p.headIf, p.binding, p.queryExec, p.nextStmt, p.innerIf,
+                p.getIntStmt, p.accumulate, p.loopVarUpdate));
+        if (p.outerIf != null) recognized.add(p.outerIf);
+        if (p.condAssign != null) recognized.add(p.condAssign);
+        if (p.headConst != null) recognized.add(p.headConst);
+        recognized.addAll(p.orderSensitive);
+        for (InvokeStmt stmt : p.orderSensitive) {
+            if (!isReplayable(stmt, p)) return false;
+        }
+        for (Stmt stmt : candidate.getStatements()) {
+            if (stmt == p.exitTarget || stmt instanceof soot.jimple.ReturnStmt) continue;
+            if (recognized.contains(stmt) || isLoopBookkeeping(stmt)) continue;
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isReplayable(InvokeStmt stmt, Parts p) {
+        InvokeExpr invoke = stmt.getInvokeExpr();
+        for (Value arg : invoke.getArgs()) {
+            if (!arg.equals(p.loopVar) && !arg.equals(p.resultVal)
+                    && !(arg instanceof soot.jimple.Constant)) return false;
+        }
+        return true;
+    }
+
+    /** Move only independent binding/update statements; dependent code stays put. */
+    private void reorderStatements(Parts p) {
+        if (p.binding == null || p.loopVarUpdate == null) return;
+        if (body.getUnits().getPredOf(p.binding) == p.loopVarUpdate
+                && !usesLocal(p.binding, (Local) ((AssignStmt) p.loopVarUpdate).getLeftOp())) {
+            body.getUnits().remove(p.binding);
+            body.getUnits().insertBefore(p.binding, p.loopVarUpdate);
+        }
+    }
+
+    private boolean usesLocal(Unit unit, Local local) {
+        for (soot.ValueBox box : unit.getUseBoxes()) {
+            if (box.getValue().equals(local)) return true;
+        }
+        return false;
+    }
+
+    private boolean isLoopBookkeeping(Stmt stmt) {
+        if (stmt instanceof soot.jimple.GotoStmt || stmt instanceof soot.jimple.NopStmt) return true;
+        if (!(stmt instanceof AssignStmt)) return false;
+        Value right = ((AssignStmt) stmt).getRightOp();
+        if (right instanceof soot.jimple.CastExpr) {
+            right = ((soot.jimple.CastExpr) right).getOp();
+        }
+        return right instanceof StaticInvokeExpr || right instanceof AddExpr
+                || right instanceof SubExpr || right instanceof soot.jimple.Constant;
+    }
+
+    private boolean usesResult(IfStmt ifs, Local result) {
+        Value condition = ifs.getCondition();
+        return condition instanceof ConditionExpr
+                && (((ConditionExpr) condition).getOp1().equals(result)
+                || ((ConditionExpr) condition).getOp2().equals(result));
     }
 
     private boolean usesCondition(IfStmt ifs, Local condLocal) {
@@ -270,15 +385,11 @@ public class BodyRewriter {
     // Transformation dispatch
     // ------------------------------------------------------------------
 
-    private void transformLoop(Loop loop) {
-        Parts p = classify(loop);
-        if (p == null) {
-            return;
-        }
+    private void transformLoop(AnalyzedLoopCandidate candidate, Parts p) {
         if (p.conditional) {
-            transformConditionalLoop(loop, p);
+            transformConditionalLoop(candidate, p);
         } else {
-            transformSimpleLoop(loop, p);
+            transformSimpleLoop(candidate, p);
         }
     }
 
@@ -286,7 +397,7 @@ public class BodyRewriter {
     // Simple path: loop splitting + query rewrite
     // ------------------------------------------------------------------
 
-    private void transformSimpleLoop(Loop loop, Parts p) {
+    private void transformSimpleLoop(AnalyzedLoopCandidate candidate, Parts p) {
         SootClass dbps = resolve("dbridge.runtime.DBridgePreparedStatement");
 
         // addBatch after each binding
@@ -306,15 +417,17 @@ public class BodyRewriter {
             }
         }
 
-        List<Unit> newUnits = buildBatchAndResultLoop(p.pstmt, p.rs, p.nextResult, p.resultVal, p.agg, p.exitTarget);
+        List<Unit> newUnits = buildBatchAndResultLoop(p.pstmt, p.rs, p.nextResult, p.resultVal,
+                p.agg, p.resultGetter, p.exitTarget);
         for (Unit newUnit : newUnits) {
             body.getUnits().insertBefore(newUnit, p.exitTarget);
         }
-        ((IfStmt) newUnits.get(3)).setTarget(p.exitTarget);
+        ((IfStmt) newUnits.get(4)).setTarget(p.exitTarget);
     }
 
     private List<Unit> buildBatchAndResultLoop(Local pstmt, Local rs, Local nextResult,
-                                               Local resultVal, Local agg, Unit exitTarget) {
+                                               Local resultVal, Local agg, String resultGetter,
+                                               Unit exitTarget) {
         SootClass dbps = resolve("dbridge.runtime.DBridgePreparedStatement");
         SootClass rsClass = resolve("java.sql.ResultSet");
 
@@ -324,20 +437,22 @@ public class BodyRewriter {
                 Arrays.asList(), RefType.v("java.sql.ResultSet"), false);
         SootMethodRef rsNextRef = Scene.v().makeMethodRef(rsClass, "next",
                 Arrays.asList(), BooleanType.v(), false);
-        SootMethodRef rsGetIntRef = Scene.v().makeMethodRef(rsClass, "getInt",
-                Arrays.asList(IntType.v()), IntType.v(), false);
+        soot.Type resultType = resultVal.getType();
+        SootMethodRef rsGetRef = Scene.v().makeMethodRef(rsClass, resultGetter,
+                Arrays.asList(IntType.v()), resultType, false);
 
         List<Unit> units = new ArrayList<>();
         units.add(Jimple.v().newInvokeStmt(
                 Jimple.v().newVirtualInvokeExpr(pstmt, executeBatchRef, new ArrayList<Value>())));
         units.add(Jimple.v().newAssignStmt(rs,
                 Jimple.v().newVirtualInvokeExpr(pstmt, getResultSetRef, new ArrayList<Value>())));
+        units.add(Jimple.v().newIfStmt(Jimple.v().newEqExpr(rs, soot.jimple.NullConstant.v()), exitTarget));
         Unit rsNext = Jimple.v().newAssignStmt(nextResult,
                 Jimple.v().newInterfaceInvokeExpr(rs, rsNextRef, new ArrayList<Value>()));
         units.add(rsNext);
         units.add(Jimple.v().newIfStmt(Jimple.v().newEqExpr(nextResult, IntConstant.v(0)), exitTarget));
         units.add(Jimple.v().newAssignStmt(resultVal,
-                Jimple.v().newInterfaceInvokeExpr(rs, rsGetIntRef, Arrays.asList(IntConstant.v(1)))));
+                Jimple.v().newInterfaceInvokeExpr(rs, rsGetRef, Arrays.asList(IntConstant.v(1)))));
         units.add(Jimple.v().newAssignStmt(agg, Jimple.v().newAddExpr(agg, resultVal)));
         units.add(Jimple.v().newGotoStmt(rsNext));
         return units;
@@ -347,7 +462,7 @@ public class BodyRewriter {
     // Conditional + order-sensitive path (the paper's Example 3 -> 4)
     // ------------------------------------------------------------------
 
-    private void transformConditionalLoop(Loop loop, Parts p) {
+    private void transformConditionalLoop(AnalyzedLoopCandidate candidate, Parts p) {
         SootClass dbps = resolve("dbridge.runtime.DBridgePreparedStatement");
         SootClass lct = resolve("dbridge.runtime.LoopContextTable");
 
@@ -358,7 +473,7 @@ public class BodyRewriter {
         Unit newLct = Jimple.v().newAssignStmt(ctx,
                 Jimple.v().newNewExpr(RefType.v("dbridge.runtime.LoopContextTable")));
         Unit callInit = Jimple.v().newInvokeStmt(Jimple.v().newSpecialInvokeExpr(ctx, lctInit));
-        Unit loopHead = loop.getHead();
+        Unit loopHead = candidate.getHead();
         Unit beforeLoop = body.getUnits().getPredOf(loopHead);
         if (beforeLoop == null) {
             body.getUnits().insertBefore(newLct, loopHead);
@@ -399,10 +514,13 @@ public class BodyRewriter {
         body.getUnits().insertAfter(addRecord, p.loopVarUpdate);
 
         // 6. Remove the query/result/order-sensitive statements from the loop.
-        for (Unit unit : new Unit[]{p.queryExec, p.nextStmt, p.innerIf, p.getIntStmt, p.accumulate, p.orderSensitive}) {
+        for (Unit unit : new Unit[]{p.queryExec, p.nextStmt, p.innerIf, p.getIntStmt, p.accumulate}) {
             if (unit != null) {
                 body.getUnits().remove(unit);
             }
+        }
+        for (InvokeStmt orderSensitive : p.orderSensitive) {
+            body.getUnits().remove(orderSensitive);
         }
 
         // 7. executeBatch + mergeResults + result loop before the loop exit.
@@ -429,10 +547,15 @@ public class BodyRewriter {
                 Arrays.asList(), BooleanType.v(), false);
         SootMethodRef nextRef = Scene.v().makeMethodRef(iter, "next",
                 Arrays.asList(), RefType.v("java.lang.Object"), false);
-        SootMethodRef getIntRef = Scene.v().makeMethodRef(rec, "getInt",
-                Arrays.asList(IntType.v()), IntType.v(), false);
+        String getter = p.resultGetter.equals("getLong") ? "getLong"
+                : p.resultGetter.equals("getString") ? "getString" : "getInt";
+        soot.Type resultType = p.resultVal.getType();
+        SootMethodRef getResultRef = Scene.v().makeMethodRef(rec, getter,
+                Arrays.asList(IntType.v()), resultType, false);
         SootMethodRef getBoolRef = Scene.v().makeMethodRef(rec, "getBoolean",
                 Arrays.asList(IntType.v()), BooleanType.v(), false);
+        SootMethodRef getIntRef = Scene.v().makeMethodRef(rec, "getInt",
+                Arrays.asList(IntType.v()), IntType.v(), false);
 
         Local it = Jimple.v().newLocal("it", RefType.v("java.util.Iterator"));
         Local nextObject = Jimple.v().newLocal("nextObject", RefType.v("java.lang.Object"));
@@ -480,13 +603,15 @@ public class BodyRewriter {
         units.add(Jimple.v().newAssignStmt(p.loopVar,
                 Jimple.v().newVirtualInvokeExpr(record, getIntRef, Arrays.asList(IntConstant.v(2)))));
         units.add(Jimple.v().newAssignStmt(p.resultVal,
-                Jimple.v().newVirtualInvokeExpr(record, getIntRef, Arrays.asList(IntConstant.v(3)))));
+                Jimple.v().newVirtualInvokeExpr(record, getResultRef, Arrays.asList(IntConstant.v(3)))));
 
         // accumulate: agg = agg + resultVal
         units.add(Jimple.v().newAssignStmt(p.agg, Jimple.v().newAddExpr(p.agg, p.resultVal)));
 
-        // order-sensitive op, re-pointed at record columns
-        units.add(rewriteOrderSensitive(p, record, getIntRef));
+        // Replay every retained side effect in source order.
+        for (InvokeStmt orderSensitive : p.orderSensitive) {
+            units.add(rewriteOrderSensitive(orderSensitive, p, record));
+        }
 
         // goto loop head
         units.add(Jimple.v().newGotoStmt(hasNext));
@@ -494,8 +619,7 @@ public class BodyRewriter {
         return units;
     }
 
-    private Unit rewriteOrderSensitive(Parts p, Local record, SootMethodRef getIntRef) {
-        InvokeStmt orderStmt = (InvokeStmt) p.orderSensitive;
+    private Unit rewriteOrderSensitive(InvokeStmt orderStmt, Parts p, Local record) {
         InvokeExpr ie = orderStmt.getInvokeExpr();
         List<Value> args = new ArrayList<>();
         for (Value arg : ie.getArgs()) {

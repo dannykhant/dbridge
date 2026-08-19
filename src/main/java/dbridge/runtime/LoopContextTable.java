@@ -47,9 +47,10 @@ public class LoopContextTable implements Iterable<Record> {
         if (rs == null) {
             return;
         }
+        int ordinalColumn = rs.getMetaData().getColumnCount();
         while (rs.next()) {
             Object aggregate = rs.getObject(1);
-            long ordinal = rs.getLong(3);
+            long ordinal = rs.getLong(ordinalColumn);
             if (!rs.wasNull() && ordinal >= 0 && ordinal < byOrdinal.size()) {
                 Record r = byOrdinal.get((int) ordinal);
                 r.set("result", aggregate);

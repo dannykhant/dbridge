@@ -1,6 +1,7 @@
 package dbridge.analysis.jdbc.expr.node;
 
 import dbridge.analysis.jdbc.expr.OpType;
+import dbridge.analysis.jdbc.expr.exceptions.QueryTranslationException;
 import dbridge.analysis.region.regions.LoopRegion;
 
 import java.util.ArrayList;
@@ -11,12 +12,10 @@ import java.util.List;
  * Created by the loop region analyzer when the loop-splitting precondition is
  * satisfied, and remembers the loop(s) it has "swallowed".
  */
-public class FoldNode extends Node {
+public class FoldNode extends Node implements SQLTranslatable {
 
     private final VarNode aggVar;
     private final VarNode loopVar;
-    private final List<LoopRegion> loopsSwallowed = new ArrayList<>();
-
     public FoldNode(Node bodyExpr, VarNode aggVar, VarNode loopVar) {
         super(OpType.Fold, bodyExpr);
         this.aggVar = aggVar;
@@ -36,11 +35,46 @@ public class FoldNode extends Node {
     }
 
     public void addLoopSwallowed(LoopRegion region) {
-        loopsSwallowed.add(region);
+        super.addLoopSwallowed(region);
     }
 
     @Override
-    public List<LoopRegion> getLoopsSwallowed() {
-        return loopsSwallowed;
+    public String toSQLQuery() throws QueryTranslationException {
+        String query = translate(getBodyExpr(), this);
+        if (query == null) {
+            throw new QueryTranslationException(this + " has no JDBC query source");
+        }
+        return query;
+    }
+
+    private static String translate(Node node, Node fold) throws QueryTranslationException {
+        if (node == null) {
+            return null;
+        }
+        if (node != fold && node instanceof SQLTranslatable) {
+            try {
+                return ((SQLTranslatable) node).toSQLQuery();
+            } catch (QueryTranslationException ignored) {
+                // A procedural wrapper may contain a translatable relational branch.
+            }
+        }
+        if (node instanceof StringConstNode) {
+            String value = ((StringConstNode) node).getValue();
+            String normalized = value == null ? "" : value.trim().toLowerCase();
+            return normalized.startsWith("select ") ? value : null;
+        }
+        if (node instanceof IfNode) {
+            String query = translate(((IfNode) node).getThenExpr(), fold);
+            if (query == null) query = translate(((IfNode) node).getElseExpr(), fold);
+            if (query == null) query = translate(((IfNode) node).getCondition(), fold);
+            return query;
+        }
+        for (Node child : node.getChildren()) {
+            String query = translate(child, fold);
+            if (query != null) {
+                return query;
+            }
+        }
+        return null;
     }
 }

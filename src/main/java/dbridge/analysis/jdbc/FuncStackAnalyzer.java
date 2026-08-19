@@ -5,6 +5,7 @@ import dbridge.analysis.jdbc.expr.node.Node;
 import dbridge.analysis.jdbc.expr.node.RetVarNode;
 import dbridge.analysis.jdbc.expr.node.UnAlgNode;
 import dbridge.analysis.jdbc.expr.node.VarNode;
+import dbridge.analysis.jdbc.trans.TransDriver;
 import dbridge.analysis.region.RegionGraphBuilder;
 import dbridge.analysis.region.exceptions.RegionAnalysisException;
 import dbridge.analysis.region.regions.ARegion;
@@ -56,6 +57,8 @@ public class FuncStackAnalyzer {
             return;
         }
         retNode = dir.find(retVar);
+        retNode = TransDriver.applyAllTransRules(retNode);
+        dir.insert(retVar, retNode);
         retRegion = retNode.getRegion();
         retType = dir.findRetVarType();
         loopsSwallowed = retNode.getLoopsSwallowed();

@@ -45,6 +45,28 @@ public final class NodeFactory {
                 return UnAlgNode.v();
             case Bottom:
                 return new BinaryOpNode(OpType.Bottom, null, null);
+            case Zero:
+            case One:
+            case MethodIterator:
+            case MethodNext:
+            case SelfRef:
+            case FieldRef:
+            case Dao:
+            case MethodBooleanValue:
+            case CartesianProd:
+            case LazyFetch:
+            case PlaceholderVar:
+            case MethodInsert:
+            case FuncParams:
+            case FuncExpr:
+            case Ternary:
+            case Select:
+            case Seq:
+            case Project:
+            case ClassRef:
+            case ConstTable:
+            case CountStar:
+                return new GenericNode(opType, children);
             default:
                 throw new IllegalArgumentException("Unsupported op type: " + opType);
         }
